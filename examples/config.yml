@@ -1,0 +1,25 @@
+schema_version: 1
+organisation: example-teaching-org
+subject: COMP3018
+term: 2026S2
+template: example-teaching-org/teaching-template
+
+naming:
+  group_team: "{subject}-{term}-{group_id}"
+  individual_team: "IND-{student_id}"
+
+repositories:
+  permission: push
+  group:
+    - name: "{subject}-{term}-{group_id}"
+      description: "{subject} {term} project repository for {group_id}"
+    - name: "{subject}-{term}-{group_id}-documentation"
+      description: "{subject} {term} documentation repository for {group_id}"
+  individual_description: "{subject} {term} individual repository for {student_id}"
+
+paths:
+  ledger: ".gh-edu/{subject}-{term}-invitations.json"
+  reports: reports
+
+roster:
+  github_login_column: github_login

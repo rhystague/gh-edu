@@ -1,0 +1,4 @@
+student_id,email,group_id,github_login
+12345678,12345678@student.example.edu.au,G01,
+23456789,23456789@student.example.edu.au,G01,verified-student-login
+34567890,34567890@student.example.edu.au,G02,
