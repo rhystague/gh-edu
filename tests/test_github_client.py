@@ -8,6 +8,7 @@ import pytest
 from gh_edu.github import (
     GhCliClient,
     GitHubAuthError,
+    GitHubInvitationLimitError,
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubRateLimitError,
@@ -76,6 +77,70 @@ def test_check_auth_runs_gh_status_then_reads_login(
             "text": True,
             "timeout": 12,
         }
+
+
+def test_get_organisation_parses_age_and_plan_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout=json.dumps(
+                    {
+                        "login": "teaching-org",
+                        "created_at": "2020-01-01T00:00:00Z",
+                        "plan": {"name": "team"},
+                    }
+                )
+            )
+        ],
+    )
+
+    organisation = GhCliClient().get_organisation("teaching-org")
+
+    assert organisation.login == "teaching-org"
+    assert organisation.created_at == "2020-01-01T00:00:00Z"
+    assert organisation.plan_name == "team"
+    assert calls[0][0][2] == "/orgs/teaching-org"
+
+
+def test_invitation_abuse_422_is_a_recoverable_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout='{"message":"Validation Failed: endpoint has been spammed"}',
+                stderr="gh: request failed (HTTP 422)",
+                returncode=1,
+            )
+        ],
+    )
+
+    with pytest.raises(GitHubInvitationLimitError):
+        GhCliClient().invite_member("teaching-org", "student@example.edu.au", [123])
+
+
+def test_ordinary_invitation_422_remains_a_permanent_response_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout='{"message":"Validation Failed"}',
+                stderr="gh: request failed (HTTP 422)",
+                returncode=1,
+            )
+        ],
+    )
+
+    with pytest.raises(GitHubResponseError) as raised:
+        GhCliClient().invite_member("teaching-org", "student@example.edu.au", [123])
+
+    assert not isinstance(raised.value, GitHubInvitationLimitError)
 
 
 def test_create_team_builds_exact_post_fields_and_parses_identity(
@@ -262,18 +327,12 @@ def test_team_member_listing_returns_stable_identity_and_membership_metadata(
 
     members = GhCliClient().list_team_members("teaching-org", "identity-team")
 
-    assert [
-        (member.id, member.login, member.role, member.inherited)
-        for member in members
-    ] == [
+    assert [(member.id, member.login, member.role, member.inherited) for member in members] == [
         (501, "Student-Login", "member", False),
         (502, "course-maintainer", "maintainer", True),
     ]
     args = calls[0][0]
-    assert (
-        "/orgs/teaching-org/teams/identity-team/members"
-        "?role=all&per_page=100"
-    ) in args
+    assert ("/orgs/teaching-org/teams/identity-team/members?role=all&per_page=100") in args
     assert "--paginate" in args
     assert "--slurp" in args
 
@@ -307,10 +366,7 @@ def test_add_team_member_uses_current_login_and_parses_active_state(
     assert args[:3] == [
         "gh",
         "api",
-        (
-            "/orgs/teaching-org/teams/group-team/memberships/"
-            "Student%20Login%2FWith%20Slash"
-        ),
+        ("/orgs/teaching-org/teams/group-team/memberships/Student%20Login%2FWith%20Slash"),
     ]
     assert args[args.index("--method") + 1] == "PUT"
     assert "role=member" in args

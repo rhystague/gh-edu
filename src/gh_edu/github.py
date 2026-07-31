@@ -88,6 +88,15 @@ class FailedInvitation:
     team_ids: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class Organisation:
+    """Organisation metadata needed to select conservative invitation limits."""
+
+    login: str
+    created_at: str
+    plan_name: str | None = None
+
+
 class GitHubError(RuntimeError):
     """Base class for sanitised GitHub adapter failures."""
 
@@ -134,6 +143,10 @@ class GitHubRateLimitError(GitHubResponseError):
         self.reset_at_epoch = reset_at_epoch
 
 
+class GitHubInvitationLimitError(GitHubRateLimitError):
+    """GitHub rejected an invitation because its abuse window was exhausted."""
+
+
 class GitHubNotFoundError(GitHubResponseError):
     """The requested GitHub resource was not found or was not visible."""
 
@@ -149,6 +162,12 @@ class GitHubNetworkError(GitHubError):
 class GitHubClient(Protocol):
     """GitHub operations used by discovery, planning, and execution."""
 
+    @property
+    def hostname(self) -> str:
+        """Return the GitHub hostname used by this client."""
+
+        ...
+
     def check_auth(self) -> str:
         """Validate the active CLI session and return its GitHub login."""
 
@@ -156,6 +175,11 @@ class GitHubClient(Protocol):
 
     def check_organisation(self, org: str) -> None:
         """Require active administrator/owner membership of ``org``."""
+
+        ...
+
+    def get_organisation(self, org: str) -> Organisation:
+        """Return age and plan metadata for invitation pacing."""
 
         ...
 
@@ -405,6 +429,24 @@ class GhCliClient:
                 operation=f"check membership of organisation {org}",
             )
 
+    def get_organisation(self, org: str) -> Organisation:
+        endpoint = f"/orgs/{_path_segment(org)}"
+        payload = self._api_json(
+            endpoint,
+            operation=f"read organisation {org}",
+        )
+        data = _expect_object(payload, f"organisation {org}")
+        plan_value = data.get("plan")
+        plan_name: str | None = None
+        if plan_value is not None:
+            plan = _expect_object(plan_value, f"plan for organisation {org}")
+            plan_name = _optional_string(plan, "name")
+        return Organisation(
+            login=_required_string(data, "login", f"organisation {org}"),
+            created_at=_required_string(data, "created_at", f"organisation {org}"),
+            plan_name=plan_name,
+        )
+
     def get_repository(self, owner: str, name: str) -> Repository:
         endpoint = f"/repos/{_path_segment(owner)}/{_path_segment(name)}"
         payload = self._api_json(endpoint, operation=f"read repository {owner}/{name}")
@@ -492,8 +534,7 @@ class GhCliClient:
 
     def list_team_members(self, org: str, slug: str) -> list[TeamMember]:
         endpoint = (
-            f"/orgs/{_path_segment(org)}/teams/{_path_segment(slug)}"
-            "/members?role=all&per_page=100"
+            f"/orgs/{_path_segment(org)}/teams/{_path_segment(slug)}/members?role=all&per_page=100"
         )
         payload = self._api_json(
             endpoint,
@@ -502,8 +543,7 @@ class GhCliClient:
         )
         members = _expect_paginated_objects(payload, f"members of team {org}/{slug}")
         return [
-            _parse_team_member(member, context=f"member of team {org}/{slug}")
-            for member in members
+            _parse_team_member(member, context=f"member of team {org}/{slug}") for member in members
         ]
 
     def get_team_repository_permission(
@@ -807,6 +847,26 @@ class GhCliClient:
                 ),
             )
 
+        invitation_abuse = (
+            status_code == 422
+            and operation.startswith("invite ")
+            and any(marker in diagnostic for marker in ("abuse", "limit", "spam", "too many"))
+        )
+        if invitation_abuse:
+            raise GitHubInvitationLimitError(
+                message,
+                status_code=status_code,
+                operation=operation,
+                retry_after_seconds=_extract_header_integer(
+                    f"{stderr}\n{stdout}",
+                    _RETRY_AFTER_PATTERN,
+                ),
+                reset_at_epoch=_extract_header_integer(
+                    f"{stderr}\n{stdout}",
+                    _RESET_AT_PATTERN,
+                ),
+            )
+
         if status_code == 404:
             raise GitHubNotFoundError(
                 message,
@@ -1012,13 +1072,11 @@ def _parse_team_membership(value: object) -> TeamMembership:
     state = _required_string(data, "state", "team membership").casefold()
     if role not in {"member", "maintainer"}:
         raise GitHubResponseError(
-            f"GitHub returned an invalid team membership response: "
-            f"unsupported role {role!r}"
+            f"GitHub returned an invalid team membership response: unsupported role {role!r}"
         )
     if state not in {"active", "pending"}:
         raise GitHubResponseError(
-            f"GitHub returned an invalid team membership response: "
-            f"unsupported state {state!r}"
+            f"GitHub returned an invalid team membership response: unsupported state {state!r}"
         )
     return TeamMembership(role=role, state=state)
 

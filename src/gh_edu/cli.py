@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, NoReturn
 
@@ -16,6 +19,8 @@ from gh_edu.core import (
     ConfirmationError,
     DesiredGroup,
     ExecutionOutcome,
+    ExecutionPacer,
+    ExecutionProgress,
     InputValidationError,
     InvitationLedger,
     Plan,
@@ -28,11 +33,16 @@ from gh_edu.core import (
     build_semester_close_plan,
     discover_snapshot,
     execute_plan,
+    execution_state_path,
+    format_duration,
     ledger_path,
     load_configuration,
+    load_execution_state,
     load_ledger,
     load_roster,
+    lock_execution_state,
     reports_path,
+    resolve_invitation_budget,
     terminal_summary_lines,
     verify_execution,
     write_markdown_report,
@@ -135,6 +145,61 @@ ValidateRepositoryOption = Annotated[
         help="Require and validate each individual roster row's repository.",
     ),
 ]
+WaitForLimitsOption = Annotated[
+    bool,
+    typer.Option(
+        "--wait-for-limits",
+        help="Wait through hourly, daily, and GitHub-provided rate-limit windows.",
+    ),
+]
+
+
+class ConsoleProgress:
+    """Compact interactive progress with durable non-interactive summaries."""
+
+    def __init__(self) -> None:
+        self.interactive = sys.stdout.isatty()
+        self.last_reported_at = 0.0
+        self.live_line = False
+
+    def _clear_live(self) -> None:
+        if self.interactive and self.live_line:
+            typer.echo("\r\x1b[2K", nl=False)
+            self.live_line = False
+
+    def update(self, progress: ExecutionProgress) -> None:
+        percent = round(progress.processed * 100 / progress.total) if progress.total else 100
+        remaining = max(0, progress.total - progress.processed)
+        line = (
+            f"Apply {progress.processed}/{progress.total} ({percent}%) | "
+            f"{progress.phase} | ok {progress.successful} failed {progress.failed} | "
+            f"elapsed {format_duration(progress.elapsed_seconds)} | "
+            f"minimum ETA {format_duration(remaining)}"
+        )
+        current = time.monotonic()
+        if self.interactive:
+            typer.echo(f"\r\x1b[2K{line}", nl=False)
+            self.live_line = True
+        elif (
+            progress.processed == progress.total
+            or progress.processed % 10 == 0
+            or current - self.last_reported_at >= 30
+        ):
+            typer.echo(line)
+            self.last_reported_at = current
+
+    def waiting(self, reason: str, resume_at: datetime, remaining_seconds: int) -> None:
+        self._clear_live()
+        local_resume = resume_at.astimezone().isoformat(timespec="seconds")
+        typer.echo(
+            f"Paused: {reason}. Resume at {local_resume} "
+            f"({format_duration(remaining_seconds)} remaining)."
+        )
+
+    def finish(self) -> None:
+        if self.interactive and self.live_line:
+            typer.echo()
+            self.live_line = False
 
 
 def make_client(_config: Configuration) -> GitHubClient:
@@ -212,16 +277,51 @@ def _apply_and_report(
     ledger: InvitationLedger,
     report_kind: str,
     report_title: str,
+    wait_for_limits: bool,
 ) -> ExecutionOutcome:
     # The plan report is written by the caller before this function.  That is a
     # hard safety boundary: no remote mutation can occur until the plan exists.
-    outcome = execute_plan(
-        plan,
-        client=client,
-        config=config,
-        ledger=ledger,
-        ledger_file=ledger_file,
+    state_file = execution_state_path(config_path, config)
+    reporter = ConsoleProgress()
+    total_writes = sum(
+        action.is_write and action.status.value == "planned" for action in plan.actions
     )
+    invitation_budget = (
+        plan.execution_estimate.invitation_budget
+        if plan.execution_estimate is not None
+        else resolve_invitation_budget(config, None)
+    )
+    try:
+        with lock_execution_state(state_file):
+            state = load_execution_state(
+                state_file,
+                hostname=client.hostname,
+                organisation=config.organisation,
+            )
+            pacer = ExecutionPacer(
+                path=state_file,
+                state=state,
+                content_limit=config.execution.content_writes_per_hour,
+                invitation_limit=invitation_budget,
+                total_writes=total_writes,
+                wait_for_limits=wait_for_limits,
+                progress=reporter.update,
+                waiting=reporter.waiting,
+            )
+            outcome = execute_plan(
+                plan,
+                client=client,
+                config=config,
+                ledger=ledger,
+                ledger_file=ledger_file,
+                pacer=pacer,
+            )
+    except KeyboardInterrupt:
+        reporter.finish()
+        typer.echo("Apply interrupted; rerun the same command to reconcile and continue.", err=True)
+        raise typer.Exit(code=130) from None
+    reporter.finish()
+    typer.echo("Verifying completed GitHub changes...")
     outcome = verify_execution(outcome, client=client, config=config)
     outcome.plan.title = report_title
     apply_report = write_plan_report(
@@ -230,9 +330,22 @@ def _apply_and_report(
         outcome.plan,
         kind=report_kind,
     )
-    label = "Apply complete" if outcome.exit_code == 0 else "Apply partially complete"
+    if outcome.exit_code == 0:
+        label = "Apply complete"
+    elif outcome.exit_code == EXIT_RATE_LIMIT:
+        label = "Apply paused by an execution limit"
+    else:
+        label = "Apply partially complete"
     _print_result(label, apply_report, outcome.plan)
     if outcome.exit_code:
+        metrics = outcome.plan.execution_metrics
+        if metrics is not None and metrics.next_eligible_at is not None:
+            typer.echo(
+                "Execution limit reached; retry at "
+                f"{metrics.next_eligible_at.astimezone().isoformat(timespec='seconds')} "
+                "or rerun with --wait-for-limits.",
+                err=True,
+            )
         raise typer.Exit(code=outcome.exit_code)
     return outcome
 
@@ -268,9 +381,7 @@ def roster_validate(
     try:
         config = load_configuration(config_path)
         if add_repository and mode == RosterMode.GROUPS:
-            raise InputValidationError(
-                "--add-repository is only valid with --mode individuals"
-            )
+            raise InputValidationError("--add-repository is only valid with --mode individuals")
         if mode == RosterMode.INDIVIDUALS:
             roster = load_roster(
                 roster_path,
@@ -335,6 +446,7 @@ def status(config_path: ConfigOption, roster_path: RosterOption) -> None:
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
         client = make_client(config)
+        typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(client, config, groups, ledger)
         plan = build_provision_plan(
             config,
@@ -357,6 +469,7 @@ def provision_groups(
     roster_path: RosterOption,
     add_individual: AddIndividualOption = False,
     apply: ApplyOption = False,
+    wait_for_limits: WaitForLimitsOption = False,
 ) -> None:
     """Provision each roster group and safely resolve existing student identities."""
 
@@ -369,6 +482,7 @@ def provision_groups(
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
         client = make_client(config)
+        typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(client, config, groups, ledger)
         plan = build_provision_plan(
             config,
@@ -394,6 +508,7 @@ def provision_groups(
             ledger=ledger,
             report_kind="provision-apply",
             report_title="GitHub Provisioning Apply Report",
+            wait_for_limits=wait_for_limits,
         )
     except typer.Exit:
         raise
@@ -411,6 +526,7 @@ def provision_individual(
         typer.Option("--repository", help="Exact individual repository name."),
     ],
     apply: ApplyOption = False,
+    wait_for_limits: WaitForLimitsOption = False,
 ) -> None:
     """Provision the one-team-per-student exception workflow."""
 
@@ -426,6 +542,7 @@ def provision_individual(
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
         client = make_client(config)
+        typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(client, config, groups, ledger)
         plan = build_provision_plan(
             config,
@@ -452,6 +569,7 @@ def provision_individual(
             ledger=ledger,
             report_kind="individual-apply",
             report_title="GitHub Individual Provisioning Apply Report",
+            wait_for_limits=wait_for_limits,
         )
     except typer.Exit:
         raise
@@ -465,6 +583,7 @@ def provision_individuals(
     roster_path: RosterOption,
     add_repository: AddRepositoryOption = False,
     apply: ApplyOption = False,
+    wait_for_limits: WaitForLimitsOption = False,
 ) -> None:
     """Provision one individual team for every roster student."""
 
@@ -484,6 +603,7 @@ def provision_individuals(
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
         client = make_client(config)
+        typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(
             client,
             config,
@@ -516,6 +636,7 @@ def provision_individuals(
             ledger=ledger,
             report_kind="individuals-apply",
             report_title="GitHub Batch Individual Provisioning Apply Report",
+            wait_for_limits=wait_for_limits,
         )
     except typer.Exit:
         raise
@@ -529,6 +650,7 @@ def retry_expired(
     roster_path: RosterOption,
     add_individual: AddIndividualOption = False,
     apply: ApplyOption = False,
+    wait_for_limits: WaitForLimitsOption = False,
 ) -> None:
     """Retry only invitations explicitly confirmed as expired."""
 
@@ -541,6 +663,7 @@ def retry_expired(
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
         client = make_client(config)
+        typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(
             client,
             config,
@@ -575,6 +698,7 @@ def retry_expired(
             ledger=ledger,
             report_kind="retry-expired-apply",
             report_title="GitHub Expired Invitation Retry Apply Report",
+            wait_for_limits=wait_for_limits,
         )
     except typer.Exit:
         raise
@@ -608,6 +732,7 @@ def semester_close(
             help="Exact configured term required for semester closure.",
         ),
     ] = None,
+    wait_for_limits: WaitForLimitsOption = False,
 ) -> None:
     """Archive cohort repositories and optionally remove team access."""
 
@@ -624,6 +749,7 @@ def semester_close(
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
         client = make_client(config)
+        typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(
             client,
             config,
@@ -657,6 +783,7 @@ def semester_close(
             ledger=ledger,
             report_kind="semester-close-apply",
             report_title="GitHub Semester Close Apply Report",
+            wait_for_limits=wait_for_limits,
         )
     except typer.Exit:
         raise

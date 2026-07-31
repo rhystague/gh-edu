@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
-from gh_edu.core import load_configuration, reports_path
+from gh_edu.core import ExecutionProgress, load_configuration, reports_path
 from gh_edu.github import GitHubAuthError, GitHubError, GitHubRateLimitError
 
 
@@ -43,6 +45,87 @@ def test_roster_validate_help_exposes_modes_and_repository_option(runner) -> Non
     assert "groups" in result.stdout
     assert "individuals" in result.stdout
     assert "--add-repository" in result.stdout
+
+
+def test_mutating_command_help_exposes_wait_for_limits(runner) -> None:
+    from gh_edu.cli import app
+
+    commands = [
+        ["provision", "groups", "--help"],
+        ["provision", "individual", "--help"],
+        ["provision", "individuals", "--help"],
+        ["invitations", "retry-expired", "--help"],
+        ["semester", "close", "--help"],
+    ]
+
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0
+        assert "--wait-for-limits" in result.stdout
+
+
+def test_tty_progress_uses_one_updating_aggregate_line(monkeypatch) -> None:
+    from gh_edu.cli import ConsoleProgress
+
+    emitted: list[tuple[str, bool]] = []
+    monkeypatch.setattr("gh_edu.cli.sys.stdout", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(
+        "gh_edu.cli.typer.echo",
+        lambda message="", *, nl=True, **_kwargs: emitted.append((str(message), nl)),
+    )
+    reporter = ConsoleProgress()
+
+    reporter.update(
+        ExecutionProgress(
+            processed=25,
+            total=100,
+            successful=24,
+            failed=1,
+            phase="create repository",
+            elapsed_seconds=90,
+        )
+    )
+
+    assert emitted == [
+        (
+            "\r\x1b[2KApply 25/100 (25%) | create repository | ok 24 failed 1 | "
+            "elapsed 1m 30s | minimum ETA 1m 15s",
+            False,
+        )
+    ]
+
+
+def test_non_tty_progress_emits_every_ten_writes_or_thirty_seconds(
+    monkeypatch,
+) -> None:
+    from gh_edu.cli import ConsoleProgress
+
+    emitted: list[str] = []
+    times = iter([1.0, 2.0, 32.0])
+    monkeypatch.setattr("gh_edu.cli.sys.stdout", SimpleNamespace(isatty=lambda: False))
+    monkeypatch.setattr("gh_edu.cli.time.monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        "gh_edu.cli.typer.echo",
+        lambda message="", **_kwargs: emitted.append(str(message)),
+    )
+    reporter = ConsoleProgress()
+
+    for processed in (1, 10, 11):
+        reporter.update(
+            ExecutionProgress(
+                processed=processed,
+                total=100,
+                successful=processed,
+                failed=0,
+                phase="send invitation",
+                elapsed_seconds=processed,
+            )
+        )
+
+    assert len(emitted) == 2
+    assert emitted[0].startswith("Apply 10/100")
+    assert emitted[1].startswith("Apply 11/100")
+    assert all("@" not in line for line in emitted)
 
 
 def test_roster_validate_writes_markdown_without_calling_github(
@@ -313,9 +396,7 @@ def test_roster_validate_individual_mode_enforces_configured_github_login_column
     fake_client,
     invoke_cli,
 ) -> None:
-    config_path = config_factory(
-        overrides={"roster": {"github_login_column": "github_login"}}
-    )
+    config_path = config_factory(overrides={"roster": {"github_login_column": "github_login"}})
     roster_path = roster_factory(
         [{"student_id": "00123456", "email": "00123456@student.example.edu.au"}],
         headers=["student_id", "email"],
@@ -407,6 +488,156 @@ def test_apply_plan_report_exists_before_first_github_write(
     assert result.exit_code == 0
     assert "Apply complete" in result.stdout
     assert list(report_directory.glob("*_provision-apply.md"))
+
+
+def test_apply_reports_aggregate_progress_and_persists_execution_state(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Discovering GitHub state" in result.output
+    assert "Apply 1/4" in result.output
+    assert "Apply 4/4 (100%)" in result.output
+    assert "Verifying completed GitHub changes" in result.output
+    assert "12345678@student.example.edu.au" not in result.output
+    state_file = config_path.parent / ".gh-edu" / "teaching-org-execution-state.json"
+    assert state_file.exists()
+    report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
+    content = report.read_text(encoding="utf-8")
+    assert "## Execution pacing" in content
+    assert "One-second pacing wait" in content
+    assert "Rate-limit retries: 0" in content
+
+
+def test_wait_for_limits_retries_server_rate_limit(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    fake_client.fail_next(
+        "create_team",
+        GitHubRateLimitError("secondary rate limit", retry_after_seconds=120),
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+            "--wait-for-limits",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Paused: GitHub reported a recoverable rate limit" in result.output
+    create_calls = [call for call in fake_client.calls if call.operation == "create_team"]
+    assert len(create_calls) == 2
+    report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
+    assert "Rate-limit retries: 1" in report.read_text(encoding="utf-8")
+
+
+def test_apply_without_wait_stops_at_local_hourly_budget(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory(overrides={"execution": {"content_writes_per_hour": 1}})
+    roster_path = roster_factory()
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 5
+    assert "Apply paused by an execution limit" in result.output
+    assert "retry at" in result.output
+    assert "--wait-for-limits" in result.output
+    assert len(fake_client.write_calls) == 1
+
+
+def test_interrupted_apply_is_resumable_from_remote_and_execution_state(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    fake_client.fail_next("create_team", KeyboardInterrupt())
+
+    interrupted = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+        ],
+    )
+
+    assert interrupted.exit_code == 130
+    assert "rerun the same command" in interrupted.output
+    state_file = config_path.parent / ".gh-edu" / "teaching-org-execution-state.json"
+    assert state_file.exists()
+
+    resumed = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+        ],
+    )
+
+    assert resumed.exit_code == 0, resumed.output
+    assert "Apply complete" in resumed.output
+    create_team_calls = [
+        call for call in fake_client.calls if call.operation == "create_team"
+    ]
+    assert len(create_team_calls) == 2
 
 
 def test_auth_check_success_and_authorisation_exit_code(

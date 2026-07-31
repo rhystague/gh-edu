@@ -8,16 +8,22 @@ plan.
 from __future__ import annotations
 
 import csv
+import fcntl
 import json
+import math
 import os
 import re
 import string
 import tempfile
+import time
 import unicodedata
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,11 +43,13 @@ from gh_edu.github import (
     GitHubAuthError,
     GitHubClient,
     GitHubError,
+    GitHubInvitationLimitError,
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubRateLimitError,
     GitHubResponseError,
     Invitation,
+    Organisation,
     Repository,
     Team,
     TeamMember,
@@ -66,6 +74,16 @@ class InputValidationError(ApplicationError):
     """Configuration, roster, naming, or ledger validation failed."""
 
     exit_code = EXIT_VALIDATION
+
+
+class ExecutionLimitError(ApplicationError):
+    """A local or remote pacing window requires a later retry."""
+
+    exit_code = EXIT_RATE_LIMIT
+
+    def __init__(self, message: str, *, next_eligible_at: datetime) -> None:
+        super().__init__(message)
+        self.next_eligible_at = next_eligible_at
 
 
 class ConfirmationError(ApplicationError):
@@ -190,6 +208,23 @@ class RepositorySettings(StrictModel):
 class PathsSettings(StrictModel):
     ledger: str = ".gh-edu/{subject}-{term}-invitations.json"
     reports: str = "reports"
+    execution_state: str = ".gh-edu/{organisation}-execution-state.json"
+
+
+class ExecutionSettings(StrictModel):
+    content_writes_per_hour: int = Field(default=450, strict=True, ge=1, le=450)
+    invitation_budget_per_24_hours: Literal["auto"] | int = "auto"
+
+    @field_validator("invitation_budget_per_24_hours", mode="before")
+    @classmethod
+    def validate_invitation_budget(cls, value: Any) -> Literal["auto"] | int:
+        if value == "auto":
+            return "auto"
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("invitation_budget_per_24_hours must be 'auto' or 1 to 500")
+        if not 1 <= value <= 500:
+            raise ValueError("invitation_budget_per_24_hours must be 'auto' or 1 to 500")
+        return int(value)
 
 
 class RosterSettings(StrictModel):
@@ -256,6 +291,7 @@ class Configuration(StrictModel):
     repositories: RepositorySettings = Field(default_factory=RepositorySettings)
     paths: PathsSettings = Field(default_factory=PathsSettings)
     roster: RosterSettings = Field(default_factory=RosterSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
 
     @model_validator(mode="before")
     @classmethod
@@ -328,6 +364,11 @@ class Configuration(StrictModel):
         _validate_template(
             self.paths.reports,
             label="paths.reports",
+            allowed=_PATH_FIELDS,
+        )
+        _validate_template(
+            self.paths.execution_state,
+            label="paths.execution_state",
             allowed=_PATH_FIELDS,
         )
         return self
@@ -575,6 +616,22 @@ class Action(StrictModel):
         return self.action_type in WRITE_ACTIONS
 
 
+class ExecutionEstimate(StrictModel):
+    planned_writes: int
+    planned_invitations: int
+    minimum_seconds: int
+    content_windows: int
+    invitation_windows: int
+    invitation_budget: int
+
+
+class ExecutionMetrics(StrictModel):
+    pacing_wait_seconds: float = 0.0
+    limit_wait_seconds: float = 0.0
+    rate_limit_retries: int = 0
+    next_eligible_at: datetime | None = None
+
+
 class Plan(StrictModel):
     title: str
     organisation: str
@@ -584,6 +641,8 @@ class Plan(StrictModel):
     generated_at: datetime
     actions: list[Action]
     warnings: list[str] = Field(default_factory=list)
+    execution_estimate: ExecutionEstimate | None = None
+    execution_metrics: ExecutionMetrics | None = None
 
     @field_serializer("generated_at")
     def serialise_generated_at(self, value: datetime) -> str:
@@ -604,6 +663,7 @@ class Snapshot(StrictModel):
     ledger: InvitationLedger
     template: Repository | None = None
     invitation_team_ids: dict[int, set[int]] = Field(default_factory=dict)
+    organisation: Organisation | None = None
 
     @property
     def teams_by_name(self) -> dict[str, Team]:
@@ -628,6 +688,35 @@ class ExecutionOutcome(StrictModel):
     successful_writes: int
     failed_writes: int
     blocked_writes: int
+
+
+class ExecutionState(StrictModel):
+    schema_version: Literal[1] = 1
+    hostname: str
+    organisation: str
+    content_writes: list[datetime] = Field(default_factory=list)
+    invitations: list[datetime] = Field(default_factory=list)
+
+    @field_validator("content_writes", "invitations")
+    @classmethod
+    def require_aware_timestamps(cls, values: list[datetime]) -> list[datetime]:
+        if any(value.tzinfo is None for value in values):
+            raise ValueError("execution-state timestamps must include a timezone")
+        return values
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionProgress:
+    processed: int
+    total: int
+    successful: int
+    failed: int
+    phase: str
+    elapsed_seconds: float
+
+
+ProgressCallback = Callable[[ExecutionProgress], None]
+WaitCallback = Callable[[str, datetime, int], None]
 
 
 def utc_now() -> datetime:
@@ -684,6 +773,306 @@ def reports_path(config_path: Path, config: Configuration) -> Path:
     return resolve_config_path(config_path, config.paths.reports, config)
 
 
+def execution_state_path(config_path: Path, config: Configuration) -> Path:
+    return resolve_config_path(config_path, config.paths.execution_state, config)
+
+
+def resolve_invitation_budget(
+    config: Configuration,
+    organisation: Organisation | None,
+    *,
+    now: datetime | None = None,
+) -> int:
+    configured = config.execution.invitation_budget_per_24_hours
+    if configured != "auto":
+        return configured
+    current = now or utc_now()
+    old_enough = False
+    if organisation is not None:
+        try:
+            created_at = datetime.fromisoformat(organisation.created_at.replace("Z", "+00:00"))
+        except ValueError:
+            created_at = None
+        if created_at is not None and created_at.tzinfo is not None:
+            old_enough = current - created_at.astimezone(UTC) >= timedelta(days=30)
+    paid = (
+        organisation is not None
+        and organisation.plan_name is not None
+        and organisation.plan_name.casefold() not in {"free", "free_org"}
+    )
+    return 450 if old_enough or paid else 45
+
+
+def attach_execution_estimate(
+    plan: Plan,
+    config: Configuration,
+    organisation: Organisation | None,
+) -> None:
+    planned = [
+        action
+        for action in plan.actions
+        if action.is_write and action.status == ActionStatus.PLANNED
+    ]
+    write_count = len(planned)
+    invitation_count = sum(action.action_type == ActionType.SEND_INVITATION for action in planned)
+    content_limit = config.execution.content_writes_per_hour
+    invitation_budget = resolve_invitation_budget(
+        config,
+        organisation,
+        now=plan.generated_at,
+    )
+    content_windows = math.ceil(write_count / content_limit) if write_count else 0
+    invitation_windows = math.ceil(invitation_count / invitation_budget) if invitation_count else 0
+    one_second_floor = max(0, write_count - 1)
+    content_floor = max(0, content_windows - 1) * 3600 + max(
+        0, write_count - max(0, content_windows - 1) * content_limit - 1
+    )
+    invitation_floor = max(0, invitation_windows - 1) * 86400 + max(
+        0, invitation_count - max(0, invitation_windows - 1) * invitation_budget - 1
+    )
+    plan.execution_estimate = ExecutionEstimate(
+        planned_writes=write_count,
+        planned_invitations=invitation_count,
+        minimum_seconds=max(one_second_floor, content_floor, invitation_floor),
+        content_windows=content_windows,
+        invitation_windows=invitation_windows,
+        invitation_budget=invitation_budget,
+    )
+    if content_windows > 1:
+        plan.warnings.append(
+            f"The apply contains {write_count} GitHub writes and spans at least "
+            f"{content_windows} hourly pacing windows."
+        )
+    if invitation_windows > 1:
+        plan.warnings.append(
+            f"The apply contains {invitation_count} invitations and spans at least "
+            f"{invitation_windows} rolling 24-hour invitation windows."
+        )
+
+
+def load_execution_state(
+    path: Path,
+    *,
+    hostname: str,
+    organisation: str,
+) -> ExecutionState:
+    if not path.exists():
+        return ExecutionState(hostname=hostname, organisation=organisation)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise InputValidationError(f"Could not read execution state {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise InputValidationError(f"Execution state {path} is corrupted: {exc}") from exc
+    try:
+        state = ExecutionState.model_validate(raw)
+    except ValidationError as exc:
+        raise InputValidationError(
+            f"Execution state {path} is invalid: {format_validation_error(exc)}"
+        ) from exc
+    if state.hostname.casefold() != hostname.casefold():
+        raise InputValidationError(
+            f"Execution state {path} belongs to GitHub hostname {state.hostname!r}, "
+            f"not {hostname!r}"
+        )
+    if state.organisation.casefold() != organisation.casefold():
+        raise InputValidationError(
+            f"Execution state {path} belongs to organisation {state.organisation!r}, "
+            f"not {organisation!r}"
+        )
+    return state
+
+
+def save_execution_state_atomic(path: Path, state: ExecutionState) -> None:
+    content = json.dumps(state.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+    _write_text_atomic(path, content)
+
+
+@contextmanager
+def lock_execution_state(path: Path) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f"{path.name}.lock")
+    try:
+        handle = lock_path.open("a+", encoding="utf-8")
+    except OSError as exc:
+        raise InputValidationError(f"Could not open execution lock {lock_path}: {exc}") from exc
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise InputValidationError(
+                f"Another gh-edu apply is already using execution state {path}"
+            ) from exc
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+class ExecutionPacer:
+    """Persist and enforce conservative rolling GitHub write budgets."""
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        state: ExecutionState,
+        content_limit: int,
+        invitation_limit: int,
+        total_writes: int,
+        wait_for_limits: bool,
+        now: Callable[[], datetime] = utc_now,
+        sleep: Callable[[float], None] = time.sleep,
+        progress: ProgressCallback | None = None,
+        waiting: WaitCallback | None = None,
+    ) -> None:
+        self.path = path
+        self.state = state
+        self.content_limit = content_limit
+        self.invitation_limit = invitation_limit
+        self.wait_for_limits = wait_for_limits
+        self.now = now
+        self.sleep = sleep
+        self.progress = progress
+        self.waiting = waiting
+        self.metrics = ExecutionMetrics()
+        self.total_writes = total_writes
+        self.processed = 0
+        self.successful = 0
+        self.failed = 0
+        self.started_at = now()
+        self.last_attempt_finished_at: datetime | None = None
+        self._remote_retries = 0
+
+    def _prune(self, current: datetime) -> None:
+        content_cutoff = current - timedelta(hours=1)
+        invitation_cutoff = current - timedelta(hours=24)
+        self.state.content_writes = [
+            value for value in self.state.content_writes if value > content_cutoff
+        ]
+        self.state.invitations = [
+            value for value in self.state.invitations if value > invitation_cutoff
+        ]
+
+    def _wait_until(self, reason: str, resume_at: datetime, *, pacing: bool) -> None:
+        current = self.now()
+        remaining = max(0.0, (resume_at - current).total_seconds())
+        if remaining <= 0:
+            return
+        if not pacing and not self.wait_for_limits:
+            self.metrics.next_eligible_at = resume_at
+            raise ExecutionLimitError(
+                f"{reason}; retry at {format_timestamp(resume_at)} or use --wait-for-limits",
+                next_eligible_at=resume_at,
+            )
+        while remaining > 0:
+            if not pacing and self.waiting is not None:
+                self.waiting(reason, resume_at, math.ceil(remaining))
+            step = remaining if pacing else min(60.0, remaining)
+            self.sleep(step)
+            if pacing:
+                self.metrics.pacing_wait_seconds += step
+            else:
+                self.metrics.limit_wait_seconds += step
+            remaining = max(0.0, (resume_at - self.now()).total_seconds())
+        self.metrics.next_eligible_at = None
+
+    def before_write(self, *, invitation: bool) -> None:
+        current = self.now()
+        prior_attempts = self.state.content_writes
+        pacing_anchor = self.last_attempt_finished_at
+        if prior_attempts:
+            persisted_anchor = max(prior_attempts)
+            if pacing_anchor is None or persisted_anchor > pacing_anchor:
+                pacing_anchor = persisted_anchor
+        if pacing_anchor is not None:
+            self._wait_until(
+                "one-second GitHub mutation delay",
+                pacing_anchor + timedelta(seconds=1),
+                pacing=True,
+            )
+            current = self.now()
+        self._prune(current)
+        waits: list[tuple[str, datetime]] = []
+        if len(self.state.content_writes) >= self.content_limit:
+            waits.append(
+                (
+                    "GitHub hourly content-write budget is exhausted",
+                    min(self.state.content_writes) + timedelta(hours=1),
+                )
+            )
+        if invitation and len(self.state.invitations) >= self.invitation_limit:
+            waits.append(
+                (
+                    "GitHub rolling 24-hour invitation budget is exhausted",
+                    min(self.state.invitations) + timedelta(hours=24),
+                )
+            )
+        if waits:
+            reason, resume_at = max(waits, key=lambda item: item[1])
+            self.metrics.next_eligible_at = resume_at
+            self._wait_until(reason, resume_at, pacing=False)
+            current = self.now()
+            self._prune(current)
+        timestamp = self.now()
+        self.state.content_writes.append(timestamp)
+        if invitation:
+            self.state.invitations.append(timestamp)
+        save_execution_state_atomic(self.path, self.state)
+
+    def finish_attempt(self) -> None:
+        self.last_attempt_finished_at = self.now()
+
+    def handle_remote_limit(
+        self,
+        error: GitHubRateLimitError,
+        *,
+        invitation: bool,
+    ) -> None:
+        self._remote_retries += 1
+        self.metrics.rate_limit_retries += 1
+        current = self.now()
+        reset_at = (
+            datetime.fromtimestamp(error.reset_at_epoch, tz=UTC)
+            if error.reset_at_epoch is not None
+            else None
+        )
+        if error.retry_after_seconds is not None:
+            resume_at = current + timedelta(seconds=error.retry_after_seconds)
+        elif reset_at is not None and reset_at > current:
+            resume_at = reset_at
+        elif invitation and isinstance(error, GitHubInvitationLimitError):
+            future = [
+                value + timedelta(hours=24)
+                for value in self.state.invitations
+                if value + timedelta(hours=24) > current
+            ]
+            resume_at = min(future) if future else current + timedelta(hours=24)
+        else:
+            seconds = min(3600, 60 * (2 ** (self._remote_retries - 1)))
+            resume_at = current + timedelta(seconds=seconds)
+        self.metrics.next_eligible_at = resume_at
+        self._wait_until("GitHub reported a recoverable rate limit", resume_at, pacing=False)
+
+    def finish_action(self, *, phase: str, succeeded: bool) -> None:
+        self.processed += 1
+        if succeeded:
+            self.successful += 1
+        else:
+            self.failed += 1
+        if self.progress is not None:
+            self.progress(
+                ExecutionProgress(
+                    processed=self.processed,
+                    total=self.total_writes,
+                    successful=self.successful,
+                    failed=self.failed,
+                    phase=phase,
+                    elapsed_seconds=max(0.0, (self.now() - self.started_at).total_seconds()),
+                )
+            )
+
+
 def validate_repository_name(value: str) -> str:
     value = value.strip()
     if (
@@ -731,8 +1120,7 @@ def load_roster(
 ) -> Roster:
     if include_repository and config.roster.github_login_column == "repository":
         raise InputValidationError(
-            "The repository column cannot also be configured as "
-            "roster.github_login_column"
+            "The repository column cannot also be configured as roster.github_login_column"
         )
     try:
         handle = path.open("r", encoding="utf-8-sig", newline="")
@@ -1015,9 +1403,7 @@ def build_individual_resources(
             if student.repository is None
         )
     if errors:
-        raise InputValidationError(
-            "Individual roster is invalid:\n- " + "\n- ".join(errors)
-        )
+        raise InputValidationError("Individual roster is invalid:\n- " + "\n- ".join(errors))
 
     groups = [
         _build_individual_group(
@@ -1076,14 +1462,11 @@ def _identity_groups_for_desired_groups(
         for student in group.students:
             identity = _build_individual_group(config, student)
             existing = identities.get(student.student_id)
-            if (
-                existing is not None
-                and normalise_resource_name(existing.team_name)
-                != normalise_resource_name(identity.team_name)
-            ):
+            if existing is not None and normalise_resource_name(
+                existing.team_name
+            ) != normalise_resource_name(identity.team_name):
                 raise InputValidationError(
-                    f"Student {student.student_id!r} maps to conflicting "
-                    "individual team names"
+                    f"Student {student.student_id!r} maps to conflicting individual team names"
                 )
             identities[student.student_id] = identity
     result = [identities[student_id] for student_id in sorted(identities)]
@@ -1240,9 +1623,7 @@ def record_observed_pending_invitation(
     attempt_count: int | None = None,
 ) -> LedgerRecord:
     selected_target = target
-    if selected_target is None and (
-        action.group_id is not None and action.team_name is not None
-    ):
+    if selected_target is None and (action.group_id is not None and action.team_name is not None):
         selected_target = InvitationTarget(
             scope=action.scope,
             group_id=action.group_id,
@@ -1283,8 +1664,7 @@ def record_observed_pending_invitation(
             attempt_count
             if attempt_count is not None
             else (
-                existing.attempt_count
-                + (existing.invitation_id != action.invitation_id)
+                existing.attempt_count + (existing.invitation_id != action.invitation_id)
                 if existing is not None
                 else 1
             )
@@ -1350,13 +1730,12 @@ def discover_snapshot(
     require_template: bool = True,
 ) -> Snapshot:
     identity_groups = _identity_groups_for_desired_groups(config, groups)
-    discovery_groups_by_name = {
-        group.team_name: group for group in [*groups, *identity_groups]
-    }
+    discovery_groups_by_name = {group.team_name: group for group in [*groups, *identity_groups]}
     discovery_groups = list(discovery_groups_by_name.values())
 
     client.check_auth()
     client.check_organisation(config.organisation)
+    organisation = client.get_organisation(config.organisation)
     template: Repository | None = None
     if require_template:
         try:
@@ -1441,6 +1820,7 @@ def discover_snapshot(
         ledger=ledger,
         template=template,
         invitation_team_ids=invitation_team_ids,
+        organisation=organisation,
     )
 
 
@@ -1472,11 +1852,7 @@ def _member_logins(members: Sequence[TeamMember]) -> set[str]:
 
 
 def _direct_ordinary_members(members: Sequence[TeamMember]) -> list[TeamMember]:
-    return [
-        member
-        for member in members
-        if member.role == "member" and not member.inherited
-    ]
+    return [member for member in members if member.role == "member" and not member.inherited]
 
 
 def _resolve_student_identity(
@@ -1493,8 +1869,7 @@ def _resolve_student_identity(
             record.student_id == student.student_id
             and (
                 record.group_id == identity_group.group_id
-                or record.team_name.casefold()
-                == identity_group.team_name.casefold()
+                or record.team_name.casefold() == identity_group.team_name.casefold()
             )
         )
         or record.team_name.casefold() == identity_group.team_name.casefold()
@@ -1505,8 +1880,7 @@ def _resolve_student_identity(
             record.student_id != student.student_id
             or record.email.casefold() != student.email.casefold()
             or record.group_id != identity_group.group_id
-            or record.team_name.casefold()
-            != identity_group.team_name.casefold()
+            or record.team_name.casefold() != identity_group.team_name.casefold()
             or (
                 identity_team is not None
                 and record.team_id is not None
@@ -1540,9 +1914,7 @@ def _resolve_student_identity(
             reason="no individual team or individual-team ledger history exists",
         )
 
-    candidates = _direct_ordinary_members(
-        _members_for_team(snapshot, identity_team)
-    )
+    candidates = _direct_ordinary_members(_members_for_team(snapshot, identity_team))
     if not candidates:
         return IdentityResolution(
             state=IdentityResolutionState.UNRESOLVED,
@@ -1550,8 +1922,7 @@ def _resolve_student_identity(
             team_slug=identity_team.slug,
             team_id=identity_team.id,
             reason=(
-                "the individual team exists but contains no direct active "
-                "non-maintainer member"
+                "the individual team exists but contains no direct active non-maintainer member"
             ),
         )
     if len(candidates) > 1:
@@ -1560,10 +1931,7 @@ def _resolve_student_identity(
             team_name=identity_group.team_name,
             team_slug=identity_team.slug,
             team_id=identity_team.id,
-            reason=(
-                "the individual team contains multiple direct active "
-                "non-maintainer members"
-            ),
+            reason=("the individual team contains multiple direct active non-maintainer members"),
         )
 
     member = candidates[0]
@@ -1775,9 +2143,7 @@ def reconcile_invitation_bundle(
     """Reconcile one student's complete, ordered team-assignment bundle."""
 
     if not groups:
-        raise InputValidationError(
-            f"Student {student.student_id!r} has no invitation targets"
-        )
+        raise InputValidationError(f"Student {student.student_id!r} has no invitation targets")
     if len(groups) == 1:
         return reconcile_invitation(student, groups[0], snapshot)
 
@@ -1808,8 +2174,7 @@ def reconcile_invitation_bundle(
             state=InvitationState.PENDING,
             action_type=ActionType.SKIP_PENDING_INVITATION,
             reason=(
-                "a pending organisation invitation already contains every "
-                "expected team assignment"
+                "a pending organisation invitation already contains every expected team assignment"
             ),
         )
 
@@ -1856,11 +2221,7 @@ def reconcile_invitation_bundle(
     if student.github_login:
         login = student.github_login.casefold()
         memberships = [
-            (
-                team is not None
-                and login
-                in _member_logins(_members_for_team(snapshot, team))
-            )
+            (team is not None and login in _member_logins(_members_for_team(snapshot, team)))
             for group in groups
             for team in [teams_by_name.get(group.team_name)]
         ]
@@ -1868,18 +2229,14 @@ def reconcile_invitation_bundle(
             return InvitationDecision(
                 state=InvitationState.ACCEPTED_CONFIRMED,
                 action_type=ActionType.SKIP_ACCEPTED,
-                reason=(
-                    "the verified GitHub login is an active member of every "
-                    "expected team"
-                ),
+                reason=("the verified GitHub login is an active member of every expected team"),
             )
         if any(memberships):
             return InvitationDecision(
                 state=InvitationState.UNRESOLVED,
                 action_type=ActionType.REVIEW_REQUIRED,
                 reason=(
-                    "the verified GitHub login belongs to only part of the "
-                    "expected team bundle"
+                    "the verified GitHub login belongs to only part of the expected team bundle"
                 ),
             )
     else:
@@ -1888,9 +2245,7 @@ def reconcile_invitation_bundle(
             if not group.individual:
                 continue
             team = teams_by_name.get(group.team_name)
-            members = _direct_ordinary_members(
-                _members_for_team(snapshot, team)
-            )
+            members = _direct_ordinary_members(_members_for_team(snapshot, team))
             if len(members) > 1:
                 return InvitationDecision(
                     state=InvitationState.UNRESOLVED,
@@ -1902,9 +2257,7 @@ def reconcile_invitation_bundle(
                 )
             individual_member_sets.append(members)
         inferred_logins = {
-            members[0].login.casefold()
-            for members in individual_member_sets
-            if len(members) == 1
+            members[0].login.casefold() for members in individual_member_sets if len(members) == 1
         }
         if len(inferred_logins) > 1:
             return InvitationDecision(
@@ -1917,8 +2270,7 @@ def reconcile_invitation_bundle(
             memberships = [
                 (
                     team is not None
-                    and inferred_login
-                    in _member_logins(_members_for_team(snapshot, team))
+                    and inferred_login in _member_logins(_members_for_team(snapshot, team))
                 )
                 for group in groups
                 for team in [teams_by_name.get(group.team_name)]
@@ -1957,14 +2309,8 @@ def reconcile_invitation_bundle(
             ),
         )
 
-    decisions = [
-        reconcile_invitation(student, group, snapshot)
-        for group in groups
-    ]
-    if all(
-        decision.state == InvitationState.ACCEPTED_CONFIRMED
-        for decision in decisions
-    ):
+    decisions = [reconcile_invitation(student, group, snapshot) for group in groups]
+    if all(decision.state == InvitationState.ACCEPTED_CONFIRMED for decision in decisions):
         return InvitationDecision(
             state=InvitationState.ACCEPTED_CONFIRMED,
             action_type=ActionType.SKIP_ACCEPTED,
@@ -1977,8 +2323,7 @@ def reconcile_invitation_bundle(
             if record is not None and record.invitation_id is not None
         }
         if len(invitation_ids) == 1 and all(
-            record is not None and record.invitation_id is not None
-            for record in records
+            record is not None and record.invitation_id is not None for record in records
         ):
             return InvitationDecision(
                 state=InvitationState.EXPIRED,
@@ -2056,11 +2401,7 @@ def _membership_mapping_conflict(
             record.student_id != student.student_id
             or record.email.casefold() != student.email.casefold()
             or record.group_id != group.group_id
-            or (
-                record.team_id is not None
-                and team is not None
-                and record.team_id != team.id
-            )
+            or (record.team_id is not None and team is not None and record.team_id != team.id)
         ):
             return (
                 "the shared-team ledger identity or numeric team ID conflicts "
@@ -2384,10 +2725,7 @@ def build_provision_plan(
         shared_groups = [group for group in ordered_groups if not group.individual]
         if shared_groups and not retry_expired:
             identity = _resolve_student_identity(config, student, snapshot)
-            if (
-                identity.state == IdentityResolutionState.RESOLVED
-                and identity.member is not None
-            ):
+            if identity.state == IdentityResolutionState.RESOLVED and identity.member is not None:
                 for shared_group in shared_groups:
                     shared_team = teams_by_name.get(shared_group.team_name)
                     mapping_conflict = _membership_mapping_conflict(
@@ -2411,17 +2749,14 @@ def build_provision_plan(
                                 github_user_id=identity.member.id,
                                 group_id=shared_group.group_id,
                                 team_name=shared_group.team_name,
-                                team_slug=(
-                                    shared_team.slug if shared_team else None
-                                ),
+                                team_slug=(shared_team.slug if shared_team else None),
                                 team_id=shared_team.id if shared_team else None,
                                 identity_team_name=identity.team_name,
                                 identity_team_slug=identity.team_slug,
                                 identity_team_id=identity.team_id,
                                 invitation_state=InvitationState.UNRESOLVED,
                                 desired_state=(
-                                    "resolved GitHub account is an active shared "
-                                    "team member"
+                                    "resolved GitHub account is an active shared team member"
                                 ),
                                 reason=mapping_conflict,
                                 status=ActionStatus.REVIEW,
@@ -2455,23 +2790,18 @@ def build_provision_plan(
                                 github_user_id=existing_membership.id,
                                 group_id=shared_group.group_id,
                                 team_name=shared_group.team_name,
-                                team_slug=(
-                                    shared_team.slug if shared_team else None
-                                ),
+                                team_slug=(shared_team.slug if shared_team else None),
                                 team_id=shared_team.id if shared_team else None,
                                 identity_team_name=identity.team_name,
                                 identity_team_slug=identity.team_slug,
                                 identity_team_id=identity.team_id,
-                                invitation_state=(
-                                    InvitationState.ACCEPTED_CONFIRMED
-                                ),
+                                invitation_state=(InvitationState.ACCEPTED_CONFIRMED),
                                 current_state=(
                                     "resolved GitHub user is already active in "
                                     f"the shared team as {existing_membership.role}"
                                 ),
                                 desired_state=(
-                                    "resolved GitHub account is an active shared "
-                                    "team member"
+                                    "resolved GitHub account is an active shared team member"
                                 ),
                                 reason=(
                                     "the individual team resolved the student, "
@@ -2502,38 +2832,23 @@ def build_provision_plan(
                             identity_team_name=identity.team_name,
                             identity_team_slug=identity.team_slug,
                             identity_team_id=identity.team_id,
-                            invitation_state=(
-                                InvitationState.ACCEPTED_CONFIRMED
-                            ),
-                            current_state=(
-                                "resolved GitHub user is not active in the "
-                                "shared team"
-                            ),
+                            invitation_state=(InvitationState.ACCEPTED_CONFIRMED),
+                            current_state=("resolved GitHub user is not active in the shared team"),
                             desired_state=(
-                                "resolved GitHub account is an active shared "
-                                "team member"
+                                "resolved GitHub account is an active shared team member"
                             ),
-                            reason=(
-                                f"{identity.reason}; no organisation invitation "
-                                "is required"
-                            ),
-                            dependencies=list(
-                                group_dependencies[shared_group.key]
-                            ),
+                            reason=(f"{identity.reason}; no organisation invitation is required"),
+                            dependencies=list(group_dependencies[shared_group.key]),
                         )
                     )
                 continue
 
             explicit_empty_identity = (
                 any(group.individual for group in ordered_groups)
-                and (
-                    identity_team := teams_by_name.get(identity.team_name)
-                )
-                is not None
+                and (identity_team := teams_by_name.get(identity.team_name)) is not None
                 and not _members_for_team(snapshot, identity_team)
                 and not any(
-                    record.team_name.casefold()
-                    == identity.team_name.casefold()
+                    record.team_name.casefold() == identity.team_name.casefold()
                     or (
                         record.student_id == student.student_id
                         and record.group_id == f"IND-{student.student_id}"
@@ -2552,9 +2867,7 @@ def build_provision_plan(
             ):
                 primary_group = shared_groups[0]
                 primary_team = teams_by_name.get(primary_group.team_name)
-                pending_invitation = snapshot.pending_by_email.get(
-                    student.email.casefold()
-                )
+                pending_invitation = snapshot.pending_by_email.get(student.email.casefold())
                 student_actions.append(
                     Action(
                         action_id=_membership_action_id(primary_group, student),
@@ -2571,14 +2884,11 @@ def build_provision_plan(
                         identity_team_slug=identity.team_slug,
                         identity_team_id=identity.team_id,
                         invitation_id=(
-                            pending_invitation.id
-                            if pending_invitation is not None
-                            else None
+                            pending_invitation.id if pending_invitation is not None else None
                         ),
                         invitation_state=InvitationState.UNRESOLVED,
                         desired_state=(
-                            "student identity safely resolved before shared "
-                            "team assignment"
+                            "student identity safely resolved before shared team assignment"
                         ),
                         reason=(
                             f"{identity.reason}; no replacement organisation "
@@ -2600,13 +2910,10 @@ def build_provision_plan(
         reason = decision.reason
         if retry_expired:
             if decision.state == InvitationState.EXPIRED:
-                if (
-                    len(ordered_groups) == 1
-                    and _record_is_part_of_multi_team_invitation(
-                        student,
-                        ordered_groups[0],
-                        snapshot,
-                    )
+                if len(ordered_groups) == 1 and _record_is_part_of_multi_team_invitation(
+                    student,
+                    ordered_groups[0],
+                    snapshot,
                 ):
                     action_type = ActionType.REVIEW_REQUIRED
                     status = ActionStatus.REVIEW
@@ -2617,9 +2924,7 @@ def build_provision_plan(
                 else:
                     action_type = ActionType.SEND_INVITATION
                     status = ActionStatus.PLANNED
-                    reason = (
-                        f"{decision.reason}; this dedicated retry command may resend it"
-                    )
+                    reason = f"{decision.reason}; this dedicated retry command may resend it"
             elif decision.state == InvitationState.PENDING:
                 action_type = decision.action_type
                 status = (
@@ -2689,13 +2994,9 @@ def build_provision_plan(
                 team_name=primary_group.team_name,
                 team_slug=primary_team.slug if primary_team else None,
                 team_id=primary_team.id if primary_team else None,
-                invitation_id=(
-                    pending_invitation.id if pending_invitation is not None else None
-                ),
+                invitation_id=(pending_invitation.id if pending_invitation is not None else None),
                 invitation_created_at=(
-                    pending_invitation.created_at
-                    if pending_invitation is not None
-                    else None
+                    pending_invitation.created_at if pending_invitation is not None else None
                 ),
                 pending_team_ids=(
                     sorted(
@@ -2720,7 +3021,7 @@ def build_provision_plan(
             )
         )
 
-    return Plan(
+    plan = Plan(
         title=title,
         organisation=config.organisation,
         subject=config.subject,
@@ -2734,6 +3035,8 @@ def build_provision_plan(
             *student_actions,
         ],
     )
+    attach_execution_estimate(plan, config, snapshot.organisation)
+    return plan
 
 
 def build_semester_close_plan(
@@ -2911,7 +3214,7 @@ def build_semester_close_plan(
                         )
                     )
 
-    return Plan(
+    plan = Plan(
         title="GitHub Semester Close Plan",
         organisation=config.organisation,
         subject=config.subject,
@@ -2922,6 +3225,8 @@ def build_semester_close_plan(
         # removed first and archival depends on that removal.
         actions=[*remove_actions, *archive_actions],
     )
+    attach_execution_estimate(plan, config, snapshot.organisation)
+    return plan
 
 
 def _parse_github_datetime(value: str | None, fallback: datetime) -> datetime:
@@ -2985,9 +3290,7 @@ def _action_group(
         repositories=[],
         students=[],
         individual=(
-            target.individual
-            if target is not None
-            else action.scope.startswith("individual:")
+            target.individual if target is not None else action.scope.startswith("individual:")
         ),
     )
 
@@ -3024,9 +3327,8 @@ def _resolve_invitation_teams(
         team = teams.get(target.team_name)
         if team is None:
             raise RuntimeError(
-                f"Resolved team {target.team_name!r} is unavailable for "
-                f"{action.action_id}"
-        )
+                f"Resolved team {target.team_name!r} is unavailable for {action.action_id}"
+            )
         target.team_id = team.id
         target.team_slug = team.slug
         resolved.append((target, team))
@@ -3048,10 +3350,13 @@ def _shared_invitation_attempt_count(
         ledger.find(action.email or "", target.team_name)
         for target in _action_invitation_targets(action)
     ]
-    return max(
-        (record.attempt_count for record in existing if record is not None),
-        default=0,
-    ) + 1
+    return (
+        max(
+            (record.attempt_count for record in existing if record is not None),
+            default=0,
+        )
+        + 1
+    )
 
 
 def _record_successful_invitation_bundle(
@@ -3121,6 +3426,41 @@ def _adopt_pending_after_invitation_error(
     return None
 
 
+def _run_paced_write(
+    pacer: ExecutionPacer | None,
+    *,
+    action_type: ActionType,
+    invitation: bool = False,
+    operation: Callable[[], Any],
+) -> Any:
+    if pacer is None:
+        return operation()
+    phase = action_type.value.casefold().replace("_", " ")
+    while True:
+        try:
+            pacer.before_write(invitation=invitation)
+        except ExecutionLimitError:
+            pacer.finish_action(phase=phase, succeeded=False)
+            raise
+        try:
+            result = operation()
+        except GitHubRateLimitError as exc:
+            pacer.finish_attempt()
+            try:
+                pacer.handle_remote_limit(exc, invitation=invitation)
+            except ExecutionLimitError:
+                pacer.finish_action(phase=phase, succeeded=False)
+                raise
+            continue
+        except Exception:
+            pacer.finish_attempt()
+            pacer.finish_action(phase=phase, succeeded=False)
+            raise
+        pacer.finish_attempt()
+        pacer.finish_action(phase=phase, succeeded=True)
+        return result
+
+
 def execute_plan(
     plan: Plan,
     *,
@@ -3129,6 +3469,7 @@ def execute_plan(
     ledger: InvitationLedger,
     ledger_file: Path,
     now: Callable[[], datetime] = utc_now,
+    pacer: ExecutionPacer | None = None,
 ) -> ExecutionOutcome:
     if plan.mode.casefold() != "apply":
         raise InputValidationError("Refusing to execute a plan that is not in Apply mode")
@@ -3167,10 +3508,7 @@ def execute_plan(
             and action.status in {ActionStatus.SKIPPED, ActionStatus.REVIEW}
         ):
             targets = _action_invitation_targets(action)
-            target_teams = [
-                (target, teams.get(target.team_name))
-                for target in targets
-            ]
+            target_teams = [(target, teams.get(target.team_name)) for target in targets]
             mapping_conflicts = False
             for target, expected_team in target_teams:
                 existing_record = (
@@ -3183,10 +3521,7 @@ def execute_plan(
                     or existing_record.group_id != target.group_id
                     or (
                         existing_record.team_id is not None
-                        and (
-                            expected_team is None
-                            or existing_record.team_id != expected_team.id
-                        )
+                        and (expected_team is None or existing_record.team_id != expected_team.id)
                     )
                 ):
                     mapping_conflicts = True
@@ -3206,23 +3541,11 @@ def execute_plan(
             ]
             complete_bundle = all(attached)
             already_recorded = all(
-                (
-                    existing_record := (
-                        ledger.find(action.email or "", target.team_name)
-                    )
-                )
-                is not None
+                (existing_record := (ledger.find(action.email or "", target.team_name))) is not None
                 and existing_record.status
-                == (
-                    InvitationState.PENDING
-                    if target_attached
-                    else InvitationState.FAILED
-                )
+                == (InvitationState.PENDING if target_attached else InvitationState.FAILED)
                 and existing_record.invitation_id == action.invitation_id
-                and (
-                    existing_record.team_id
-                    == (team.id if team is not None else None)
-                )
+                and (existing_record.team_id == (team.id if team is not None else None))
                 for (target, team), target_attached in zip(
                     target_teams,
                     attached,
@@ -3230,29 +3553,19 @@ def execute_plan(
                 )
             )
             if already_recorded:
-                action.status = (
-                    ActionStatus.SKIPPED
-                    if complete_bundle
-                    else ActionStatus.REVIEW
-                )
+                action.status = ActionStatus.SKIPPED if complete_bundle else ActionStatus.REVIEW
                 outcomes[action.action_id] = complete_bundle
                 continue
 
             existing_records = [
-                ledger.find(action.email or "", target.team_name)
-                for target in targets
+                ledger.find(action.email or "", target.team_name) for target in targets
             ]
             prior_attempt_count = max(
-                (
-                    record.attempt_count
-                    for record in existing_records
-                    if record is not None
-                ),
+                (record.attempt_count for record in existing_records if record is not None),
                 default=0,
             )
             invitation_changed = any(
-                record is not None
-                and record.invitation_id != action.invitation_id
+                record is not None and record.invitation_id != action.invitation_id
                 for record in existing_records
             )
             observed_attempt_count = max(
@@ -3280,11 +3593,7 @@ def execute_plan(
                 )
                 outcomes[action.action_id] = False
                 continue
-            action.status = (
-                ActionStatus.SUCCEEDED
-                if complete_bundle
-                else ActionStatus.REVIEW
-            )
+            action.status = ActionStatus.SUCCEEDED if complete_bundle else ActionStatus.REVIEW
             action.reason = (
                 f"{action.reason}; the observed invitation assignments were "
                 "recorded in the local ledger"
@@ -3315,7 +3624,16 @@ def execute_plan(
             if action.action_type == ActionType.CREATE_TEAM:
                 if action.team_name is None:
                     raise RuntimeError("CREATE_TEAM action has no team name")
-                team = client.create_team(config.organisation, action.team_name)
+                team_name = action.team_name
+                team = _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    operation=partial(
+                        client.create_team,
+                        config.organisation,
+                        team_name,
+                    ),
+                )
                 if team.name != action.team_name:
                     raise RuntimeError(
                         f"GitHub returned an unexpected name for the created team: {team.name!r}"
@@ -3326,12 +3644,19 @@ def execute_plan(
             elif action.action_type == ActionType.CREATE_REPOSITORY:
                 if action.repository is None:
                     raise RuntimeError("CREATE_REPOSITORY action has no repository name")
-                created_repository = client.create_repository_from_template(
-                    config.template_owner,
-                    config.template_repository,
-                    config.organisation,
-                    action.repository,
-                    action.description or "",
+                repository_name = action.repository
+                repository_description = action.description or ""
+                created_repository = _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    operation=partial(
+                        client.create_repository_from_template,
+                        config.template_owner,
+                        config.template_repository,
+                        config.organisation,
+                        repository_name,
+                        repository_description,
+                    ),
                 )
                 if created_repository.name != action.repository:
                     raise RuntimeError(
@@ -3355,11 +3680,19 @@ def execute_plan(
                     raise RuntimeError(f"Resolved team is unavailable for {action.action_id}")
                 action.team_id = resolved_team.id
                 action.team_slug = resolved_team.slug
-                client.set_team_repository_permission(
-                    config.organisation,
-                    resolved_team.slug,
-                    action.repository,
-                    config.repositories.permission.value,
+                resolved_team_slug = resolved_team.slug
+                repository_name = action.repository
+                repository_permission = config.repositories.permission.value
+                _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    operation=partial(
+                        client.set_team_repository_permission,
+                        config.organisation,
+                        resolved_team_slug,
+                        repository_name,
+                        repository_permission,
+                    ),
                 )
             elif action.action_type == ActionType.ADD_TEAM_MEMBER:
                 if (
@@ -3373,22 +3706,13 @@ def execute_plan(
                         "or destination team"
                     )
 
-                live_teams = {
-                    team.name: team
-                    for team in client.list_teams(config.organisation)
-                }
+                live_teams = {team.name: team for team in client.list_teams(config.organisation)}
                 identity_team = live_teams.get(action.identity_team_name)
-                if (
-                    identity_team is None
-                    or identity_team.id != action.identity_team_id
-                ):
+                if identity_team is None or identity_team.id != action.identity_team_id:
                     raise GitHubResponseError(
                         "the individual identity team is missing or has a "
                         "different numeric ID; no membership write was attempted",
-                        operation=(
-                            f"revalidate identity team "
-                            f"{action.identity_team_name}"
-                        ),
+                        operation=(f"revalidate identity team {action.identity_team_name}"),
                     )
                 action.identity_team_slug = identity_team.slug
                 identity_candidates = _direct_ordinary_members(
@@ -3405,10 +3729,7 @@ def execute_plan(
                         "the individual identity team no longer contains the "
                         "same sole direct active non-maintainer member; no "
                         "membership write was attempted",
-                        operation=(
-                            f"revalidate identity member for "
-                            f"{action.identity_team_name}"
-                        ),
+                        operation=(f"revalidate identity member for {action.identity_team_name}"),
                     )
 
                 identity_member = identity_candidates[0]
@@ -3424,25 +3745,18 @@ def execute_plan(
                         "the destination shared team has a different numeric "
                         "ID from the completed plan; no membership write was "
                         "attempted",
-                        operation=(
-                            f"revalidate destination team {action.team_name}"
-                        ),
+                        operation=(f"revalidate destination team {action.team_name}"),
                     )
                 resolved_team = live_target_team or planned_team
                 if resolved_team is None:
-                    raise RuntimeError(
-                        f"Resolved team is unavailable for {action.action_id}"
-                    )
+                    raise RuntimeError(f"Resolved team is unavailable for {action.action_id}")
                 action.team_id = resolved_team.id
                 action.team_slug = resolved_team.slug
                 target_members = client.list_team_members(
                     config.organisation,
                     resolved_team.slug,
                 )
-                if any(
-                    member.id == action.github_user_id
-                    for member in target_members
-                ):
+                if any(member.id == action.github_user_id for member in target_members):
                     action.status = ActionStatus.SKIPPED
                     action.reason = (
                         "the resolved GitHub user became active in the shared "
@@ -3451,10 +3765,17 @@ def execute_plan(
                     outcomes[action.action_id] = True
                     continue
 
-                membership = client.add_team_member(
-                    config.organisation,
-                    resolved_team.slug,
-                    identity_member.login,
+                resolved_team_slug = resolved_team.slug
+                github_login = identity_member.login
+                membership = _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    operation=partial(
+                        client.add_team_member,
+                        config.organisation,
+                        resolved_team_slug,
+                        github_login,
+                    ),
                 )
                 if membership.state != "active":
                     raise GitHubResponseError(
@@ -3473,14 +3794,19 @@ def execute_plan(
                     action,
                     teams,
                 )
-                invitation = client.invite_member(
-                    config.organisation,
-                    action.email,
-                    list(
-                        dict.fromkeys(
-                            team.id
-                            for _target, team in resolved_invitation_teams
-                        )
+                invitation_email = action.email
+                invitation_team_ids = list(
+                    dict.fromkeys(team.id for _target, team in resolved_invitation_teams)
+                )
+                invitation = _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    invitation=True,
+                    operation=partial(
+                        client.invite_member,
+                        config.organisation,
+                        invitation_email,
+                        invitation_team_ids,
                     ),
                 )
                 invitation_time = _parse_github_datetime(
@@ -3513,22 +3839,38 @@ def execute_plan(
             elif action.action_type == ActionType.REMOVE_TEAM_REPOSITORY:
                 if action.team_slug is None or action.repository is None:
                     raise RuntimeError("REMOVE_TEAM_REPOSITORY action is incomplete")
-                client.remove_team_repository(
-                    config.organisation,
-                    action.team_slug,
-                    action.repository,
+                team_slug = action.team_slug
+                repository_name = action.repository
+                _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    operation=partial(
+                        client.remove_team_repository,
+                        config.organisation,
+                        team_slug,
+                        repository_name,
+                    ),
                 )
             elif action.action_type == ActionType.ARCHIVE_REPOSITORY:
                 if action.repository is None:
                     raise RuntimeError("ARCHIVE_REPOSITORY action is incomplete")
-                client.archive_repository(config.organisation, action.repository)
+                repository_name = action.repository
+                _run_paced_write(
+                    pacer,
+                    action_type=action.action_type,
+                    operation=partial(
+                        client.archive_repository,
+                        config.organisation,
+                        repository_name,
+                    ),
+                )
             else:
                 raise RuntimeError(f"Executor does not support {action.action_type.value}")
-        except (GitHubAuthError, GitHubRateLimitError) as exc:
+        except (GitHubAuthError, GitHubRateLimitError, ExecutionLimitError) as exc:
             action.status = ActionStatus.FAILED
             action.error = str(exc)
             outcomes[action.action_id] = False
-            if isinstance(exc, GitHubRateLimitError):
+            if isinstance(exc, (GitHubRateLimitError, ExecutionLimitError)):
                 rate_limited = True
             else:
                 auth_failed = True
@@ -3549,10 +3891,7 @@ def execute_plan(
                     )
                 except GitHubError:
                     recovered_members = []
-                if any(
-                    member.id == action.github_user_id
-                    for member in recovered_members
-                ):
+                if any(member.id == action.github_user_id for member in recovered_members):
                     action.status = ActionStatus.SUCCEEDED
                     action.reason = (
                         "the membership request returned a network error, but "
@@ -3576,14 +3915,8 @@ def execute_plan(
                     )
                 except GitHubError:
                     adopted = None
-                expected_team_ids = {
-                    team.id
-                    for _target, team in resolved_invitation_teams
-                }
-                if (
-                    adopted is not None
-                    and expected_team_ids.issubset(adopted.team_ids)
-                ):
+                expected_team_ids = {team.id for _target, team in resolved_invitation_teams}
+                if adopted is not None and expected_team_ids.issubset(adopted.team_ids):
                     _record_successful_invitation_bundle(
                         ledger,
                         action=action,
@@ -3668,6 +4001,8 @@ def execute_plan(
         exit_code = EXIT_PARTIAL
     else:
         exit_code = EXIT_SUCCESS
+    if pacer is not None:
+        executed.execution_metrics = pacer.metrics
     return ExecutionOutcome(
         plan=executed,
         exit_code=exit_code,
@@ -3737,23 +4072,14 @@ def verify_execution(
                             f"{config.repositories.permission.value!r}"
                         )
             elif action.action_type == ActionType.ADD_TEAM_MEMBER:
-                if (
-                    action.team_slug is None
-                    or action.github_user_id is None
-                ):
-                    error = (
-                        "membership action lacks a resolved team or numeric "
-                        "GitHub user ID"
-                    )
+                if action.team_slug is None or action.github_user_id is None:
+                    error = "membership action lacks a resolved team or numeric GitHub user ID"
                 else:
                     members = client.list_team_members(
                         config.organisation,
                         action.team_slug,
                     )
-                    if not any(
-                        member.id == action.github_user_id
-                        for member in members
-                    ):
+                    if not any(member.id == action.github_user_id for member in members):
                         error = (
                             "resolved GitHub user ID was not active in the "
                             "destination team during verification"
@@ -3793,14 +4119,8 @@ def verify_execution(
                         pending_invitation.id,
                     )
                     if not expected_team_ids.issubset(actual_team_ids):
-                        error = (
-                            "pending invitation is missing expected team IDs: "
-                            + ", ".join(
-                                str(team_id)
-                                for team_id in sorted(
-                                    expected_team_ids - actual_team_ids
-                                )
-                            )
+                        error = "pending invitation is missing expected team IDs: " + ", ".join(
+                            str(team_id) for team_id in sorted(expected_team_ids - actual_team_ids)
                         )
 
             if error is not None:
@@ -3943,6 +4263,17 @@ def _markdown_code(value: object) -> str:
     return f"{delimiter}{text}{delimiter}"
 
 
+def format_duration(seconds: float) -> str:
+    total = max(0, math.ceil(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {remaining_seconds}s"
+    if minutes:
+        return f"{minutes}m {remaining_seconds}s"
+    return f"{remaining_seconds}s"
+
+
 def _action_detail(action: Action) -> list[str]:
     lines = [f"### {_ACTION_LABELS[action.action_type]} — {_markdown_code(action.action_id)}", ""]
     fields: list[tuple[str, object | None]] = [
@@ -4031,6 +4362,38 @@ def render_plan_report(plan: Plan) -> str:
     if not status_counts:
         lines.append("| No actions | 0 |")
 
+    if plan.execution_estimate is not None:
+        estimate = plan.execution_estimate
+        lines.extend(
+            [
+                "",
+                "## Execution pacing",
+                "",
+                f"- Planned GitHub writes: {estimate.planned_writes}",
+                f"- Planned invitations: {estimate.planned_invitations}",
+                f"- Invitation budget per 24 hours: {estimate.invitation_budget}",
+                f"- Hourly content windows: {estimate.content_windows}",
+                f"- Invitation windows: {estimate.invitation_windows}",
+                f"- Estimated minimum apply time: "
+                f"{_markdown_code(format_duration(estimate.minimum_seconds))}",
+            ]
+        )
+        if plan.execution_metrics is not None:
+            metrics = plan.execution_metrics
+            lines.extend(
+                [
+                    f"- One-second pacing wait: "
+                    f"{_markdown_code(format_duration(metrics.pacing_wait_seconds))}",
+                    f"- Limit wait: {_markdown_code(format_duration(metrics.limit_wait_seconds))}",
+                    f"- Rate-limit retries: {metrics.rate_limit_retries}",
+                ]
+            )
+            if metrics.next_eligible_at is not None:
+                lines.append(
+                    f"- Next eligible write: "
+                    f"{_markdown_code(format_timestamp(metrics.next_eligible_at))}"
+                )
+
     if plan.warnings:
         lines.extend(["", "## Warnings", ""])
         lines.extend(f"- {_markdown_text(warning)}" for warning in plan.warnings)
@@ -4082,9 +4445,7 @@ def render_validation_report(
     generated_at: datetime | None = None,
 ) -> str:
     now = generated_at or utc_now()
-    resource_label = (
-        "Project groups" if mode == RosterMode.GROUPS else "Individual teams"
-    )
+    resource_label = "Project groups" if mode == RosterMode.GROUPS else "Individual teams"
     resource_heading = "Group" if mode == RosterMode.GROUPS else "Individual"
     lines = [
         "# GitHub Roster Validation",

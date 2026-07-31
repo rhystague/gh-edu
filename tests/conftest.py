@@ -6,7 +6,7 @@ import re
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -14,11 +14,12 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
-from gh_edu.core import InvitationLedger, LedgerRecord
+from gh_edu.core import ExecutionPacer, InvitationLedger, LedgerRecord
 from gh_edu.github import (
     FailedInvitation,
     GitHubError,
     Invitation,
+    Organisation,
     Repository,
     Team,
     TeamMember,
@@ -46,6 +47,11 @@ class FakeGitHubClient:
 
     def __init__(self) -> None:
         self.login = "course-admin"
+        self.organisation = Organisation(
+            login="teaching-org",
+            created_at="2020-01-01T00:00:00Z",
+            plan_name="free",
+        )
         self.template = Repository(
             id=1,
             name="teaching-template",
@@ -67,6 +73,10 @@ class FakeGitHubClient:
         self._next_repository_id = 2000
         self._next_invitation_id = 3000
         self._next_user_id = 4000
+
+    @property
+    def hostname(self) -> str:
+        return "github.com"
 
     @property
     def write_calls(self) -> list[GitHubCall]:
@@ -143,11 +153,7 @@ class FakeGitHubClient:
             role=role,
             inherited=inherited,
         )
-        self.members[slug] = {
-            existing
-            for existing in self.members[slug]
-            if existing.id != user_id
-        }
+        self.members[slug] = {existing for existing in self.members[slug] if existing.id != user_id}
         self.members[slug].add(member)
         return member
 
@@ -209,6 +215,10 @@ class FakeGitHubClient:
 
     def check_organisation(self, org: str) -> None:
         self._record("check_organisation", "GET", org)
+
+    def get_organisation(self, org: str) -> Organisation:
+        self._record("get_organisation", "GET", org)
+        return replace(self.organisation, login=org)
 
     def get_repository(self, owner: str, name: str) -> Repository:
         target = f"{owner}/{name}"
@@ -566,7 +576,19 @@ def patch_cli_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[[FakeGitHubClient], None]:
     def patch(client: FakeGitHubClient) -> None:
+        clock = [FIXED_NOW]
+
+        def now() -> datetime:
+            return clock[0]
+
+        def sleep(seconds: float) -> None:
+            clock[0] += timedelta(seconds=seconds)
+
+        def make_test_pacer(**kwargs):
+            return ExecutionPacer(**kwargs, now=now, sleep=sleep)
+
         monkeypatch.setattr("gh_edu.cli.make_client", lambda _config: client)
+        monkeypatch.setattr("gh_edu.cli.ExecutionPacer", make_test_pacer)
 
     return patch
 

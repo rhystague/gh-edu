@@ -20,6 +20,11 @@ repositories:
 paths:
   ledger: ".gh-edu/{subject}-{term}-invitations.json"
   reports: reports
+  execution_state: ".gh-edu/{organisation}-execution-state.json"
+
+execution:
+  content_writes_per_hour: 450
+  invitation_budget_per_24_hours: auto
 
 roster:
   github_login_column: github_login
