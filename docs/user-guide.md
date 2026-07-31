@@ -131,13 +131,42 @@ required. Only configure it when the login mapping is already verified.
 
 ## Validate before provisioning
 
-Validate configuration, CSV rows and generated names:
+Validate a group roster:
 
 ```console
 gh-edu roster validate \
   --config config.yml \
-  --roster groups.csv
+  --roster groups.csv \
+  --mode groups
 ```
+
+Validate an individual team roster:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individuals.csv \
+  --mode individuals
+```
+
+Validate individual repository assignments:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individuals-with-repositories.csv \
+  --mode individuals \
+  --add-repository
+```
+
+The default mode is `groups` for compatibility with earlier versions. Group
+mode requires `group_id`. Individual mode derives `IND-{student_id}` and does
+not require a `group_id` column. Adding `--add-repository` requires and
+validates the individual `repository` column.
+
+When `roster.github_login_column` is configured, that column remains required
+in both modes. Set it to `null` when the roster has no trusted GitHub-login
+mapping.
 
 Inspect current GitHub state without writing:
 
@@ -150,6 +179,17 @@ gh-edu status \
 ## Workflow 1: provision individual teams
 
 Input: `individuals.csv`
+
+Validate:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individuals.csv \
+  --mode individuals
+```
+
+Plan:
 
 ```console
 gh-edu provision individuals \
@@ -176,6 +216,18 @@ It creates no repositories.
 ## Workflow 2: provision individuals with repositories
 
 Input: `individuals-with-repositories.csv`
+
+Validate:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individuals-with-repositories.csv \
+  --mode individuals \
+  --add-repository
+```
+
+Plan:
 
 ```console
 gh-edu provision individuals \
@@ -345,7 +397,26 @@ student_id,email,repository
 23456789,23456789@student.example.edu.au,ASSIGNMENT-23456789
 ```
 
-Run:
+Validate:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individual-repositories.csv \
+  --mode individuals \
+  --add-repository
+```
+
+Plan:
+
+```console
+gh-edu provision individuals \
+  --config config.yml \
+  --roster individual-repositories.csv \
+  --add-repository
+```
+
+Apply:
 
 ```console
 gh-edu provision individuals \

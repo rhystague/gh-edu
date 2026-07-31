@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from gh_edu.core import load_configuration, reports_path
 from gh_edu.github import GitHubAuthError, GitHubError, GitHubRateLimitError
 
@@ -31,6 +33,18 @@ def test_nested_command_help_contains_all_workflows(runner) -> None:
     assert "close" in semester.stdout
 
 
+def test_roster_validate_help_exposes_modes_and_repository_option(runner) -> None:
+    from gh_edu.cli import app
+
+    result = runner.invoke(app, ["roster", "validate", "--help"])
+
+    assert result.exit_code == 0
+    assert "--mode" in result.stdout
+    assert "groups" in result.stdout
+    assert "individuals" in result.stdout
+    assert "--add-repository" in result.stdout
+
+
 def test_roster_validate_writes_markdown_without_calling_github(
     config_factory,
     roster_factory,
@@ -54,11 +68,279 @@ def test_roster_validate_writes_markdown_without_calling_github(
 
     assert result.exit_code == 0
     assert "Roster valid" in result.stdout
+    assert "Mode: groups" in result.stdout
     assert "Students: 1" in result.stdout
+    assert "Project groups: 1" in result.stdout
     assert not fake_client.calls
     reports = list((config_path.parent / "reports").glob("*_roster-validation.md"))
     assert len(reports) == 1
-    assert reports[0].read_text(encoding="utf-8").startswith("# GitHub Roster Validation\n")
+    report = reports[0].read_text(encoding="utf-8")
+    assert report.startswith("# GitHub Roster Validation\n")
+    assert "- Mode: `groups`" in report
+    assert "| Project groups | 1 |" in report
+    assert "### Group `G01`" in report
+
+
+def test_roster_validate_explicit_group_mode_still_requires_group_id(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory(
+        [{"student_id": "12345678", "email": "12345678@student.example.edu.au"}],
+        headers=["student_id", "email"],
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--mode",
+            "groups",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "missing required column(s): group_id" in result.output
+    assert not fake_client.calls
+
+
+def test_roster_validate_individual_mode_derives_group_id_and_writes_mode_aware_report(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory(
+        [{"student_id": "00123456", "email": "00123456@student.example.edu.au"}],
+        headers=["student_id", "email"],
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--mode",
+            "individuals",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Mode: individuals" in result.stdout
+    assert "Students: 1" in result.stdout
+    assert "Individual teams: 1" in result.stdout
+    assert not fake_client.calls
+    reports = list((config_path.parent / "reports").glob("*_roster-validation.md"))
+    assert len(reports) == 1
+    report = reports[0].read_text(encoding="utf-8")
+    assert "- Mode: `individuals`" in report
+    assert "| Individual teams | 1 |" in report
+    assert "| Expected repositories | 0 |" in report
+    assert "### Individual `IND-00123456`" in report
+
+
+def test_roster_validate_individual_repository_mode_validates_repository_assignments(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory(
+        [
+            {
+                "student_id": "00123456",
+                "email": "00123456@student.example.edu.au",
+                "repository": "COMP3018-W01-00123456",
+            }
+        ],
+        headers=["student_id", "email", "repository"],
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--mode",
+            "individuals",
+            "--add-repository",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Individual teams: 1" in result.stdout
+    assert not fake_client.calls
+    reports = list((config_path.parent / "reports").glob("*_roster-validation.md"))
+    report = reports[0].read_text(encoding="utf-8")
+    assert "| Expected repositories | 1 |" in report
+    assert "`COMP3018-W01-00123456`" in report
+
+
+def test_roster_validate_individual_repository_mode_requires_repository_header(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory(
+        [{"student_id": "00123456", "email": "00123456@student.example.edu.au"}],
+        headers=["student_id", "email"],
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--mode",
+            "individuals",
+            "--add-repository",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "missing required column(s): repository" in result.output
+    assert not fake_client.calls
+
+
+@pytest.mark.parametrize(
+    ("repositories", "message"),
+    [
+        (["", "repo-87654321"], "repository is required"),
+        (["invalid/repository", "repo-87654321"], "repository names must"),
+        (["shared-repository", "shared-repository"], "same repository"),
+    ],
+    ids=["blank", "invalid", "duplicate"],
+)
+def test_roster_validate_individual_repository_mode_rejects_bad_assignments(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+    repositories,
+    message,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory(
+        [
+            {
+                "student_id": "00123456",
+                "email": "00123456@student.example.edu.au",
+                "repository": repositories[0],
+            },
+            {
+                "student_id": "87654321",
+                "email": "87654321@student.example.edu.au",
+                "repository": repositories[1],
+            },
+        ],
+        headers=["student_id", "email", "repository"],
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--mode",
+            "individuals",
+            "--add-repository",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert message in result.output
+    assert not fake_client.calls
+
+
+def test_roster_validate_rejects_repository_option_for_group_mode(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--add-repository",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--add-repository is only valid with --mode individuals" in result.output
+    assert not fake_client.calls
+
+
+def test_roster_validate_individual_mode_enforces_configured_github_login_column(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory(
+        overrides={"roster": {"github_login_column": "github_login"}}
+    )
+    roster_path = roster_factory(
+        [{"student_id": "00123456", "email": "00123456@student.example.edu.au"}],
+        headers=["student_id", "email"],
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "roster",
+            "validate",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--mode",
+            "individuals",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "missing required column(s): github_login" in result.output
+    assert not fake_client.calls
+    failed_reports = list((config_path.parent / "reports").glob("*_roster-validation-failed.md"))
+    assert len(failed_reports) == 1
+    assert "- Mode: `individuals`" in failed_reports[0].read_text(encoding="utf-8")
 
 
 def test_group_cli_dry_run_has_no_remote_writes_and_prints_brief_summary(

@@ -20,6 +20,7 @@ from gh_edu.core import (
     InvitationLedger,
     Plan,
     Roster,
+    RosterMode,
     build_group_resources,
     build_individual_resource,
     build_individual_resources,
@@ -117,6 +118,21 @@ AddRepositoryOption = Annotated[
             "Create or reuse each CSV row's exact repository and grant it to "
             "that student's individual team."
         ),
+    ),
+]
+RosterModeOption = Annotated[
+    RosterMode,
+    typer.Option(
+        "--mode",
+        case_sensitive=False,
+        help="Roster workflow to validate.",
+    ),
+]
+ValidateRepositoryOption = Annotated[
+    bool,
+    typer.Option(
+        "--add-repository",
+        help="Require and validate each individual roster row's repository.",
     ),
 ]
 
@@ -240,24 +256,50 @@ def auth_check(config_path: ConfigOption) -> None:
 
 
 @roster_app.command("validate")
-def roster_validate(config_path: ConfigOption, roster_path: RosterOption) -> None:
+def roster_validate(
+    config_path: ConfigOption,
+    roster_path: RosterOption,
+    mode: RosterModeOption = RosterMode.GROUPS,
+    add_repository: ValidateRepositoryOption = False,
+) -> None:
     """Validate configuration, roster rows, and generated names."""
 
     config: Configuration | None = None
     try:
         config = load_configuration(config_path)
-        roster = load_roster(roster_path, config)
-        groups = build_group_resources(config, roster)
+        if add_repository and mode == RosterMode.GROUPS:
+            raise InputValidationError(
+                "--add-repository is only valid with --mode individuals"
+            )
+        if mode == RosterMode.INDIVIDUALS:
+            roster = load_roster(
+                roster_path,
+                config,
+                include_repository=add_repository,
+                derive_individual_group_id=True,
+            )
+            groups = build_individual_resources(
+                config,
+                roster,
+                add_repository=add_repository,
+            )
+            resource_label = "Individual teams"
+        else:
+            roster = load_roster(roster_path, config)
+            groups = build_group_resources(config, roster)
+            resource_label = "Project groups"
         report = write_roster_validation_report(
             config_path,
             config,
             roster,
             groups,
+            mode=mode,
         )
         typer.echo("Roster valid")
         typer.echo(f"Report: {report}")
+        typer.echo(f"Mode: {mode.value}")
         typer.echo(f"Students: {len(roster.students)}")
-        typer.echo(f"Groups: {len(groups)}")
+        typer.echo(f"{resource_label}: {len(groups)}")
     except typer.Exit:
         raise
     except Exception as exc:
@@ -268,7 +310,8 @@ def roster_validate(config_path: ConfigOption, roster_path: RosterOption) -> Non
                     "# GitHub Roster Validation\n\n"
                     f"- Organisation: `{config.organisation}`\n"
                     f"- Subject: `{config.subject}`\n"
-                    f"- Term: `{config.term}`\n\n"
+                    f"- Term: `{config.term}`\n"
+                    f"- Mode: `{mode.value}`\n\n"
                     "## Result\n\nValidation failed.\n\n"
                     f"- {message}\n"
                 )

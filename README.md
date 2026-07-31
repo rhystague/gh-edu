@@ -95,7 +95,7 @@ Validate the local inputs, inspect the live GitHub status, and generate a
 provisioning plan:
 
 ```console
-gh-edu roster validate --config config.yml --roster students.csv
+gh-edu roster validate --config config.yml --roster students.csv --mode groups
 gh-edu status --config config.yml --roster students.csv
 gh-edu provision groups --config config.yml --roster students.csv
 ```
@@ -242,15 +242,45 @@ organisation is accessible. It does not mutate GitHub.
 
 ### Validate a roster
 
+Group roster:
+
 ```console
 gh-edu roster validate \
   --config config.yml \
-  --roster students.csv
+  --roster groups.csv \
+  --mode groups
+```
+
+Individual team roster:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individuals.csv \
+  --mode individuals
+```
+
+Individual roster with repository assignments:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individuals-with-repositories.csv \
+  --mode individuals \
+  --add-repository
 ```
 
 Validates configuration, CSV structure, student data and generated names
 without requiring a GitHub write. A validation report is written to the
-configured reports directory.
+configured reports directory. The default mode is `groups` for backward
+compatibility. Group mode requires `group_id`; individual mode derives
+`IND-{student_id}` and does not require that column. When `--add-repository`
+is supplied, individual mode also requires and validates the `repository`
+column.
+
+If `roster.github_login_column` is configured, that column is required in
+every validation mode. Set it to `null` when the roster does not contain a
+trusted GitHub-login mapping.
 
 ### Discover current status
 
@@ -346,6 +376,15 @@ attached to the group repositories, and no individual repository is created.
 
 ### Provision individual teams from a roster
 
+Validate the roster:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individual-students.csv \
+  --mode individuals
+```
+
 Dry run:
 
 ```console
@@ -368,7 +407,18 @@ the team produced by `naming.individual_team`, and sends one team invitation
 per student. It does not create a repository or grant repository access unless
 `--add-repository` is supplied.
 
-To plan creation or assignment of the repository named in each roster row:
+To create or assign the repository named in each roster row, first validate
+the repository assignments:
+
+```console
+gh-edu roster validate \
+  --config config.yml \
+  --roster individual-students-with-repositories.csv \
+  --mode individuals \
+  --add-repository
+```
+
+Plan:
 
 ```console
 gh-edu provision individuals \
@@ -393,10 +443,12 @@ value. A missing repository is created from the configured `template`, using
 with the exact name is reused. The individual team is then granted
 `repositories.permission` on that repository.
 
-This flag affects only `provision individuals`. It does not change
-`provision groups --add-individual`: individual teams created during group
-provisioning remain team-only and receive no access to group or individual
-repositories.
+For provisioning, this flag affects only `provision individuals`. It does not
+change `provision groups --add-individual`: individual teams created during
+group provisioning remain team-only and receive no access to group or
+individual repositories. The same flag can be used with
+`roster validate --mode individuals` to validate the repository column without
+performing GitHub operations.
 
 ### Provision one individual student
 

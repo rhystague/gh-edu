@@ -82,6 +82,11 @@ class Permission(StrEnum):
     ADMIN = "admin"
 
 
+class RosterMode(StrEnum):
+    GROUPS = "groups"
+    INDIVIDUALS = "individuals"
+
+
 class InvitationState(StrEnum):
     NOT_INVITED = "not_invited"
     PENDING = "pending"
@@ -4073,15 +4078,21 @@ def render_validation_report(
     roster: Roster,
     groups: Sequence[DesiredGroup],
     *,
+    mode: RosterMode = RosterMode.GROUPS,
     generated_at: datetime | None = None,
 ) -> str:
     now = generated_at or utc_now()
+    resource_label = (
+        "Project groups" if mode == RosterMode.GROUPS else "Individual teams"
+    )
+    resource_heading = "Group" if mode == RosterMode.GROUPS else "Individual"
     lines = [
         "# GitHub Roster Validation",
         "",
         f"- Organisation: {_markdown_code(config.organisation)}",
         f"- Subject: {_markdown_code(config.subject)}",
         f"- Term: {_markdown_code(config.term)}",
+        f"- Mode: {_markdown_code(mode.value)}",
         f"- Roster: {_markdown_code(roster.source)}",
         f"- Generated: {_markdown_code(format_timestamp(now))}",
         "",
@@ -4090,7 +4101,7 @@ def render_validation_report(
         "| Item | Count |",
         "|---|---:|",
         f"| Valid students | {len(roster.students)} |",
-        f"| Project groups | {len(groups)} |",
+        f"| {resource_label} | {len(groups)} |",
         f"| Expected teams | {len(groups)} |",
         f"| Expected repositories | {sum(len(group.repositories) for group in groups)} |",
         "",
@@ -4100,7 +4111,7 @@ def render_validation_report(
     for group in groups:
         lines.extend(
             [
-                f"### Group {_markdown_code(group.group_id)}",
+                f"### {resource_heading} {_markdown_code(group.group_id)}",
                 "",
                 f"- Team: {_markdown_code(group.team_name)}",
                 f"- Students: {len(group.students)}",
@@ -4181,6 +4192,7 @@ def write_roster_validation_report(
     roster: Roster,
     groups: Sequence[DesiredGroup],
     *,
+    mode: RosterMode = RosterMode.GROUPS,
     generated_at: datetime | None = None,
 ) -> Path:
     now = generated_at or utc_now()
@@ -4191,6 +4203,7 @@ def write_roster_validation_report(
             config,
             roster,
             groups,
+            mode=mode,
             generated_at=now,
         ),
         generated_at=now,
