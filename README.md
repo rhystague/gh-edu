@@ -9,6 +9,12 @@ Markdown reports.
 Every mutating command is a dry run unless `--apply` is supplied. Run the plan,
 read its report, and only then apply it.
 
+## Documentation
+
+- [User Guide](docs/user-guide.md) — complete configuration, CSV and workflow
+  examples for individual provisioning, group provisioning, repository
+  assignment, staged membership and term closure.
+
 ## What it manages
 
 For each project group, `gh-edu` can:
