@@ -26,6 +26,24 @@ class Team:
 
 
 @dataclass(frozen=True, slots=True)
+class TeamMember:
+    """An active GitHub account visible through a team membership."""
+
+    id: int
+    login: str
+    role: str
+    inherited: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TeamMembership:
+    """The state returned after adding or updating a team membership."""
+
+    role: str
+    state: str
+
+
+@dataclass(frozen=True, slots=True)
 class Repository:
     """The GitHub repository fields needed by the provisioning workflow."""
 
@@ -171,8 +189,8 @@ class GitHubClient(Protocol):
 
         ...
 
-    def list_team_members(self, org: str, slug: str) -> set[str]:
-        """Return active non-maintainer logins for a team."""
+    def list_team_members(self, org: str, slug: str) -> list[TeamMember]:
+        """Return active members and their stable GitHub identities."""
 
         ...
 
@@ -221,6 +239,16 @@ class GitHubClient(Protocol):
         team_ids: Sequence[int],
     ) -> Invitation:
         """Invite an email address as a direct member of one or more teams."""
+
+        ...
+
+    def add_team_member(
+        self,
+        org: str,
+        slug: str,
+        username: str,
+    ) -> TeamMembership:
+        """Add an existing organisation member to a team."""
 
         ...
 
@@ -462,20 +490,21 @@ class GhCliClient:
         ]
         return {team.id for team in teams}
 
-    def list_team_members(self, org: str, slug: str) -> set[str]:
+    def list_team_members(self, org: str, slug: str) -> list[TeamMember]:
         endpoint = (
             f"/orgs/{_path_segment(org)}/teams/{_path_segment(slug)}"
-            "/members?role=member&per_page=100"
+            "/members?role=all&per_page=100"
         )
         payload = self._api_json(
             endpoint,
-            operation=f"list non-maintainer members of team {org}/{slug}",
+            operation=f"list members of team {org}/{slug}",
             paginate=True,
         )
         members = _expect_paginated_objects(payload, f"members of team {org}/{slug}")
-        return {
-            _required_string(member, "login", f"member of team {org}/{slug}") for member in members
-        }
+        return [
+            _parse_team_member(member, context=f"member of team {org}/{slug}")
+            for member in members
+        ]
 
     def get_team_repository_permission(
         self,
@@ -603,6 +632,24 @@ class GhCliClient:
             typed_fields=tuple(("team_ids[]", str(team_id)) for team_id in numeric_team_ids),
         )
         return _parse_invitation(payload, team_ids=numeric_team_ids)
+
+    def add_team_member(
+        self,
+        org: str,
+        slug: str,
+        username: str,
+    ) -> TeamMembership:
+        endpoint = (
+            f"/orgs/{_path_segment(org)}/teams/{_path_segment(slug)}"
+            f"/memberships/{_path_segment(username)}"
+        )
+        payload = self._api_json(
+            endpoint,
+            operation=f"add {username} to team {org}/{slug}",
+            method="PUT",
+            string_fields=(("role", "member"),),
+        )
+        return _parse_team_membership(payload)
 
     def archive_repository(self, org: str, repo: str) -> None:
         endpoint = f"/repos/{_path_segment(org)}/{_path_segment(repo)}"
@@ -928,6 +975,52 @@ def _parse_team(value: object) -> Team:
         slug=_required_string(data, "slug", "team"),
         privacy=_optional_string(data, "privacy"),
     )
+
+
+def _parse_team_member(
+    value: object,
+    *,
+    context: str = "team member",
+) -> TeamMember:
+    data = _expect_object(value, context)
+    role = _required_string(data, "role", context).casefold()
+    if role not in {"member", "maintainer"}:
+        raise GitHubResponseError(
+            f"GitHub returned an invalid {context} response: unsupported role {role!r}"
+        )
+    inherited = data.get("inherited")
+    if not isinstance(inherited, bool):
+        raise GitHubResponseError(
+            f"GitHub returned an invalid {context} response: 'inherited' is missing"
+        )
+    user_id = _required_integer(data, "id", context)
+    if user_id <= 0:
+        raise GitHubResponseError(
+            f"GitHub returned an invalid {context} response: 'id' must be positive"
+        )
+    return TeamMember(
+        id=user_id,
+        login=_required_string(data, "login", context),
+        role=role,
+        inherited=inherited,
+    )
+
+
+def _parse_team_membership(value: object) -> TeamMembership:
+    data = _expect_object(value, "team membership")
+    role = _required_string(data, "role", "team membership").casefold()
+    state = _required_string(data, "state", "team membership").casefold()
+    if role not in {"member", "maintainer"}:
+        raise GitHubResponseError(
+            f"GitHub returned an invalid team membership response: "
+            f"unsupported role {role!r}"
+        )
+    if state not in {"active", "pending"}:
+        raise GitHubResponseError(
+            f"GitHub returned an invalid team membership response: "
+            f"unsupported state {state!r}"
+        )
+    return TeamMembership(role=role, state=state)
 
 
 def _parse_repository(value: object, *, owner_hint: str) -> Repository:

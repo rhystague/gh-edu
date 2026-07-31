@@ -48,7 +48,10 @@ from gh_edu.github import (
 
 app = typer.Typer(
     name="gh-edu",
-    help="Provision GitHub Education resources from YAML and CSV inputs.",
+    help=(
+        "Provision GitHub Education resources, invitations, and memberships "
+        "from YAML and CSV inputs."
+    ),
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
@@ -101,8 +104,8 @@ AddIndividualOption = Annotated[
     typer.Option(
         "--add-individual",
         help=(
-            "Also create one team-only individual team per student and include "
-            "it in the same organisation invitation."
+            "Also create one team-only individual team per student; new "
+            "students receive it in the same organisation invitation."
         ),
     ),
 ]
@@ -142,7 +145,7 @@ def main(
         ),
     ] = None,
 ) -> None:
-    """Provision GitHub Education teams, repositories, and invitations."""
+    """Provision GitHub Education resources, invitations, and memberships."""
 
 
 def _fail(error: Exception) -> NoReturn:
@@ -312,7 +315,7 @@ def provision_groups(
     add_individual: AddIndividualOption = False,
     apply: ApplyOption = False,
 ) -> None:
-    """Provision one team and configured repositories for every roster group."""
+    """Provision each roster group and safely resolve existing student identities."""
 
     try:
         config, _roster, groups = _load_group_inputs(

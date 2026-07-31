@@ -21,6 +21,8 @@ from gh_edu.github import (
     Invitation,
     Repository,
     Team,
+    TeamMember,
+    TeamMembership,
 )
 
 FIXED_NOW = datetime(2026, 7, 30, 9, 42, tzinfo=UTC)
@@ -55,13 +57,16 @@ class FakeGitHubClient:
         self.repositories: dict[str, Repository] = {}
         self.pending: dict[str, Invitation] = {}
         self.failed_invitations: list[FailedInvitation] = []
-        self.members: dict[str, set[str]] = defaultdict(set)
+        self.members: dict[str, set[TeamMember]] = defaultdict(set)
+        self.user_ids: dict[str, int] = {}
+        self.pending_membership_logins: set[str] = set()
         self.permissions: dict[tuple[str, str], str] = {}
         self.calls: list[GitHubCall] = []
         self._failures: dict[tuple[str, str | None], deque[Exception]] = defaultdict(deque)
         self._next_team_id = 1000
         self._next_repository_id = 2000
         self._next_invitation_id = 3000
+        self._next_user_id = 4000
 
     @property
     def write_calls(self) -> list[GitHubCall]:
@@ -112,6 +117,40 @@ class FakeGitHubClient:
         self.repositories[name] = repository
         return repository
 
+    def add_member(
+        self,
+        slug: str,
+        login: str,
+        *,
+        user_id: int | None = None,
+        role: str = "member",
+        inherited: bool = False,
+    ) -> TeamMember:
+        login_key = login.casefold()
+        known_user_id = self.user_ids.get(login_key)
+        if user_id is None:
+            user_id = known_user_id
+        if user_id is None:
+            user_id = self._next_user_id
+            self._next_user_id += 1
+        if known_user_id is not None and known_user_id != user_id:
+            raise AssertionError("one fake GitHub login cannot have multiple user IDs")
+        self.user_ids[login_key] = user_id
+        self._next_user_id = max(self._next_user_id, user_id + 1)
+        member = TeamMember(
+            id=user_id,
+            login=login,
+            role=role,
+            inherited=inherited,
+        )
+        self.members[slug] = {
+            existing
+            for existing in self.members[slug]
+            if existing.id != user_id
+        }
+        self.members[slug].add(member)
+        return member
+
     def add_pending(
         self,
         email: str,
@@ -142,7 +181,7 @@ class FakeGitHubClient:
     ) -> None:
         self.pending.pop(email.casefold(), None)
         for slug in team_slugs:
-            self.members[slug].add(login)
+            self.add_member(slug, login)
 
     def _record(
         self,
@@ -206,9 +245,12 @@ class FakeGitHubClient:
             return set()
         return set(invitation.team_ids)
 
-    def list_team_members(self, org: str, slug: str) -> set[str]:
+    def list_team_members(self, org: str, slug: str) -> list[TeamMember]:
         self._record("list_team_members", "GET", slug)
-        return set(self.members.get(slug, set()))
+        return sorted(
+            self.members.get(slug, set()),
+            key=lambda member: (member.id, member.login.casefold()),
+        )
 
     def get_team_repository_permission(
         self,
@@ -312,6 +354,29 @@ class FakeGitHubClient:
         if email.casefold() in self.pending:
             raise GitHubError(f"a pending invitation already exists for {email}")
         return self.add_pending(email, team_ids=numeric_team_ids)
+
+    def add_team_member(
+        self,
+        org: str,
+        slug: str,
+        username: str,
+    ) -> TeamMembership:
+        target = f"{slug}/{username.casefold()}"
+        self._record(
+            "add_team_member",
+            "PUT",
+            target,
+            {"role": "member"},
+        )
+        if not any(team.slug == slug for team in self.teams.values()):
+            raise GitHubError(f"unknown team slug {slug}")
+        if username.casefold() in self.pending_membership_logins:
+            return TeamMembership(role="member", state="pending")
+        user_id = self.user_ids.get(username.casefold())
+        if user_id is None:
+            return TeamMembership(role="member", state="pending")
+        self.add_member(slug, username, user_id=user_id)
+        return TeamMembership(role="member", state="active")
 
     def archive_repository(self, org: str, repo: str) -> None:
         self._record(

@@ -188,7 +188,7 @@ def test_pending_unresolved_and_inferred_students_are_never_resent(
             )
         )
         if state == "inferred":
-            fake_client.members[team.slug].add("unmapped-student")
+            fake_client.add_member(team.slug, "unmapped-student")
     ledger = InvitationLedger(organisation=config.organisation, records=records)
     snapshot = discover_snapshot(fake_client, config, groups, ledger)
     plan = build_provision_plan(

@@ -284,6 +284,41 @@ repository, changes repository visibility, or automatically unarchives one.
 An exact-name repository that is public is reported as an error and blocks
 dependent access and invitation actions.
 
+When an existing individual team can safely identify a student,
+`provision groups` uses it automatically. The individual team is derived from
+the existing `naming.individual_team` setting and is read as an identity
+anchor; it is not created unless `--add-individual` is supplied.
+
+| Individual-team state | Group-provisioning result |
+|---|---|
+| No individual team or individual-invitation history | Preserve the ordinary group invitation flow. |
+| Exactly one direct active non-maintainer member | Add that stable GitHub user directly to the shared group team; send no invitation. |
+| The same GitHub user is already active in the shared team | Skip the membership as unchanged. |
+| Empty, ambiguous, inherited-only or conflicting individual identity | Require review; do not guess or send a replacement invitation. |
+| A pending invitation already contains the desired shared-team ID | Skip and reconcile the existing pending invitation. |
+
+This supports an individual-first workflow without a separate login mapping:
+
+```console
+gh-edu provision individuals \
+  --config config.yml \
+  --roster individual-students.csv \
+  --apply
+
+# After students accept, use the normal group roster.
+gh-edu provision groups \
+  --config config.yml \
+  --roster groups.csv \
+  --apply
+```
+
+The second command reads the sole student member from each individual team,
+uses the numeric GitHub user ID to verify identity, and uses the member's
+current login for GitHub's team-membership API. The individual team remains
+the source of truth; no additional identity database or ledger field is
+created. Group membership is additive: the command does not remove students
+from older teams or alter existing team roles.
+
 Add `--add-individual` to create a separate individual team for every student:
 
 ```console
@@ -295,11 +330,13 @@ gh-edu provision groups \
 ```
 
 This flag is opt-in and does not change ordinary group provisioning when
-omitted. With the flag, each student receives one invitation containing both
-the shared group team's ID and their individual team's ID. The shared group
-team retains the configured access to the group repositories. The individual
-team receives no repository access: it is not attached to the group
-repositories, and no individual repository is created.
+omitted. With the flag, a new student receives one invitation containing both
+the shared group team's ID and their individual team's ID. If an existing
+individual team already resolves an accepted student, the command adds that
+GitHub account directly to the shared team instead of sending another
+invitation. The shared group team retains the configured access to the group
+repositories. The individual team receives no repository access: it is not
+attached to the group repositories, and no individual repository is created.
 
 ### Provision individual teams from a roster
 
@@ -495,6 +532,8 @@ Reconciliation is deliberately conservative:
 
 | Evidence | Status | Automatic result |
 |---|---|---|
+| An individual team contains exactly one direct active non-maintainer member | `ACCEPTED_CONFIRMED` | Use that numeric GitHub user ID to add the existing organisation member directly to the desired shared team. |
+| The resolved numeric GitHub user ID is already active in the shared team | `ACCEPTED_CONFIRMED` | Skip the membership without changing its role. |
 | A pending email contains every expected team ID | `PENDING` | Skip and adopt every assignment into the ledger; never resend. |
 | A pending email is missing an expected team ID | `PENDING` with review | Record the partial mapping, require review and never replace or duplicate the invitation. |
 | No pending invitation and no ledger record | `NOT_INVITED` | Normal provisioning may send once. |
@@ -504,9 +543,11 @@ Reconciliation is deliberately conservative:
 | Expiry is explicitly established | `EXPIRED` | Only `retry-expired` may resend. |
 | A controlled operation failed | `FAILED` | Require review; never resend automatically. |
 
-For a combined group-and-individual assignment, acceptance is confirmed only
-when the same verified login—or the individual team's sole safely inferred
-member—is active in both teams. Membership in only one team requires review.
+For a combined group-and-individual assignment created before acceptance,
+acceptance is confirmed when the same verified login—or the individual team's
+sole safely inferred member—is active in both teams. In a later group run, a
+student who is active only in their individual team can now be added directly
+to the shared team without a second invitation.
 
 A missing pending invitation is not proof of expiry: it may have been
 accepted. Age alone is also not expiry evidence, even though GitHub invitations
@@ -515,9 +556,11 @@ normally expire after a limited period. `gh-edu` does not change an old
 Only a status explicitly established as `EXPIRED` by reliable GitHub evidence
 or a controlled operator reconciliation is retryable.
 
-Normal group or individual provisioning sends only for `NOT_INVITED`.
-`invitations retry-expired` sends only for `EXPIRED`. This policy favours a
-manual review over accidentally issuing duplicate invitations.
+Normal group or individual provisioning sends invitations only for
+`NOT_INVITED`. A safely resolved existing organisation member may instead
+receive a direct shared-team membership. `invitations retry-expired` sends only
+for `EXPIRED`. This policy favours a manual review over accidentally issuing
+duplicate invitations.
 
 The ledger and reports contain student IDs and email addresses. Store them in an
 appropriately protected location, exclude them from version control, and retain
@@ -556,6 +599,10 @@ applicable. Apply reports are written even after a partial failure.
 - Existing public repositories are never accepted as private cohort resources.
 - Archived repositories are never automatically unarchived.
 - Unresolved invitations are never automatically resent.
+- Direct group membership requires the same stable numeric GitHub user ID to
+  remain the sole eligible member of the individual team at execution time.
+- Group membership provisioning is additive and never removes prior
+  memberships or changes an existing role.
 - Authentication material is never written to configuration, ledgers or
   reports.
 - No supervisor-management workflow is implemented.

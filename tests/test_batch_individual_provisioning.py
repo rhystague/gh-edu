@@ -946,8 +946,8 @@ def test_combined_acceptance_requires_same_login_in_both_teams(
     individual_team = fake_client.add_team(individual_group.team_name, team_id=42)
     repository = fake_client.add_repository(shared_group.repositories[0].name)
     fake_client.permissions[(shared_team.slug, repository.name)] = "push"
-    fake_client.members[shared_team.slug].add("known-login")
-    fake_client.members[individual_team.slug].add("known-login")
+    fake_client.add_member(shared_team.slug, "known-login")
+    fake_client.add_member(individual_team.slug, "known-login")
     ledger = InvitationLedger(organisation=config.organisation)
 
     complete_snapshot = discover_snapshot(fake_client, config, groups, ledger)

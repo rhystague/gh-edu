@@ -23,7 +23,13 @@ from gh_edu.core import (
     permission_key,
     reconcile_invitation,
 )
-from gh_edu.github import FailedInvitation, Invitation, Repository, Team
+from gh_edu.github import (
+    FailedInvitation,
+    Invitation,
+    Repository,
+    Team,
+    TeamMember,
+)
 
 
 def test_loads_valid_roster_and_preserves_string_student_id(
@@ -147,6 +153,36 @@ def test_generated_names_reject_normalised_collisions(
         build_group_resources(config, roster)
 
 
+def test_group_validation_includes_derived_identity_team_names_without_flag(
+    config_factory,
+    roster_factory,
+) -> None:
+    config = load_configuration(
+        config_factory(
+            overrides={
+                "naming": {
+                    "group_team": "IND-{group_id}",
+                }
+            }
+        )
+    )
+    roster = load_roster(
+        roster_factory(
+            [
+                {
+                    "student_id": "12345678",
+                    "email": "student@example.edu.au",
+                    "group_id": "12345678",
+                }
+            ]
+        ),
+        config,
+    )
+
+    with pytest.raises(InputValidationError, match="map to the same team"):
+        build_group_resources(config, roster)
+
+
 def test_discovery_rejects_existing_normalised_collision_before_writes(
     config_factory,
     roster_factory,
@@ -215,9 +251,20 @@ def _snapshot(
         repositories=[],
         pending_invitations=invitations,
         failed_invitations=list(failed),
-        team_members={team.slug: set(members or set())},
+        team_members={
+            team.slug: [
+                TeamMember(
+                    id=index,
+                    login=login,
+                    role="member",
+                    inherited=False,
+                )
+                for index, login in enumerate(sorted(members or set()), start=1)
+            ]
+        },
         permissions={},
         ledger=InvitationLedger(organisation="teaching-org", records=list(records)),
+        invitation_team_ids={99: {team.id}} if pending else {},
     )
 
 
@@ -625,7 +672,7 @@ def test_retry_plan_only_makes_explicit_expiry_eligible(
         repositories=[repository],
         pending_invitations=[],
         failed_invitations=[],
-        team_members={team.slug: set()},
+        team_members={team.slug: []},
         permissions={
             permission_key(team.slug, repository.name): Permission.PUSH,
         },

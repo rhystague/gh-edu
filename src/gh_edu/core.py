@@ -40,9 +40,11 @@ from gh_edu.github import (
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubRateLimitError,
+    GitHubResponseError,
     Invitation,
     Repository,
     Team,
+    TeamMember,
 )
 
 EXIT_SUCCESS = 0
@@ -95,6 +97,7 @@ class ActionType(StrEnum):
     CREATE_REPOSITORY = "CREATE_REPOSITORY"
     GRANT_TEAM_REPOSITORY = "GRANT_TEAM_REPOSITORY"
     UPDATE_TEAM_REPOSITORY_PERMISSION = "UPDATE_TEAM_REPOSITORY_PERMISSION"
+    ADD_TEAM_MEMBER = "ADD_TEAM_MEMBER"
     SEND_INVITATION = "SEND_INVITATION"
     SKIP_PENDING_INVITATION = "SKIP_PENDING_INVITATION"
     SKIP_ACCEPTED = "SKIP_ACCEPTED"
@@ -120,6 +123,7 @@ WRITE_ACTIONS = frozenset(
         ActionType.CREATE_REPOSITORY,
         ActionType.GRANT_TEAM_REPOSITORY,
         ActionType.UPDATE_TEAM_REPOSITORY_PERMISSION,
+        ActionType.ADD_TEAM_MEMBER,
         ActionType.SEND_INVITATION,
         ActionType.ARCHIVE_REPOSITORY,
         ActionType.REMOVE_TEAM_REPOSITORY,
@@ -514,6 +518,21 @@ class InvitationDecision(StrictModel):
     reason: str
 
 
+class IdentityResolutionState(StrEnum):
+    ABSENT = "absent"
+    RESOLVED = "resolved"
+    UNRESOLVED = "unresolved"
+
+
+class IdentityResolution(StrictModel):
+    state: IdentityResolutionState
+    team_name: str
+    team_slug: str | None = None
+    team_id: int | None = Field(default=None, gt=0)
+    member: TeamMember | None = None
+    reason: str
+
+
 class Action(StrictModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, validate_assignment=True)
 
@@ -523,10 +542,14 @@ class Action(StrictModel):
     student_id: str | None = None
     email: str | None = None
     github_login: str | None = None
+    github_user_id: int | None = Field(default=None, gt=0)
     group_id: str | None = None
     team_name: str | None = None
     team_slug: str | None = None
     team_id: int | None = None
+    identity_team_name: str | None = None
+    identity_team_slug: str | None = None
+    identity_team_id: int | None = Field(default=None, gt=0)
     invitation_id: int | None = None
     invitation_created_at: str | None = None
     pending_team_ids: list[int] = Field(default_factory=list)
@@ -571,7 +594,7 @@ class Snapshot(StrictModel):
     repositories: list[Repository]
     pending_invitations: list[Invitation]
     failed_invitations: list[FailedInvitation]
-    team_members: dict[str, set[str]]
+    team_members: dict[str, list[TeamMember]]
     permissions: dict[str, str | None]
     ledger: InvitationLedger
     template: Repository | None = None
@@ -903,15 +926,14 @@ def build_group_resources(
         raise InputValidationError(
             "Generated resource names are invalid:\n- " + "\n- ".join(errors)
         )
+    identity_groups = build_individual_resources(
+        config,
+        roster,
+        require_group_marker=False,
+    )
+    _ensure_desired_names_are_unique([*desired_groups, *identity_groups])
     if add_individual:
-        desired_groups.extend(
-            build_individual_resources(
-                config,
-                roster,
-                require_group_marker=False,
-            )
-        )
-    _ensure_desired_names_are_unique(desired_groups)
+        desired_groups.extend(identity_groups)
     return desired_groups
 
 
@@ -1030,6 +1052,38 @@ def build_individual_resource(
         raise InputValidationError(f"Individual student input is invalid: {detail}") from exc
     _ensure_desired_names_are_unique([group])
     return group
+
+
+def _identity_groups_for_desired_groups(
+    config: Configuration,
+    groups: Sequence[DesiredGroup],
+) -> list[DesiredGroup]:
+    """Return one read-only individual identity target per shared-group student."""
+
+    identities: dict[str, DesiredGroup] = {
+        group.students[0].student_id: group
+        for group in groups
+        if group.individual and len(group.students) == 1
+    }
+    for group in groups:
+        if group.individual:
+            continue
+        for student in group.students:
+            identity = _build_individual_group(config, student)
+            existing = identities.get(student.student_id)
+            if (
+                existing is not None
+                and normalise_resource_name(existing.team_name)
+                != normalise_resource_name(identity.team_name)
+            ):
+                raise InputValidationError(
+                    f"Student {student.student_id!r} maps to conflicting "
+                    "individual team names"
+                )
+            identities[student.student_id] = identity
+    result = [identities[student_id] for student_id in sorted(identities)]
+    _ensure_desired_names_are_unique([*groups, *result])
+    return result
 
 
 def load_ledger(path: Path, organisation: str) -> InvitationLedger:
@@ -1290,6 +1344,12 @@ def discover_snapshot(
     *,
     require_template: bool = True,
 ) -> Snapshot:
+    identity_groups = _identity_groups_for_desired_groups(config, groups)
+    discovery_groups_by_name = {
+        group.team_name: group for group in [*groups, *identity_groups]
+    }
+    discovery_groups = list(discovery_groups_by_name.values())
+
     client.check_auth()
     client.check_organisation(config.organisation)
     template: Repository | None = None
@@ -1313,7 +1373,7 @@ def discover_snapshot(
     repositories = client.list_repositories(config.organisation)
     pending_invitations = client.list_pending_invitations(config.organisation)
     failed_invitations = client.list_failed_invitations(config.organisation)
-    _check_discovered_name_collisions(groups, teams, repositories)
+    _check_discovered_name_collisions(discovery_groups, teams, repositories)
     roster_emails = {student.email.casefold() for group in groups for student in group.students}
     invitation_team_ids: dict[int, set[int]] = {}
     for invitation in pending_invitations:
@@ -1332,19 +1392,21 @@ def discover_snapshot(
 
     teams_by_name = {team.name: team for team in teams}
     repositories_by_name = {repository.name: repository for repository in repositories}
-    team_members: dict[str, set[str]] = {}
+    team_members: dict[str, list[TeamMember]] = {}
     permissions: dict[str, str | None] = {}
+    for group in discovery_groups:
+        team = teams_by_name.get(group.team_name)
+        if team is None:
+            continue
+        team_members[team.slug] = client.list_team_members(
+            config.organisation,
+            team.slug,
+        )
+
     for group in groups:
         team = teams_by_name.get(group.team_name)
         if team is None:
             continue
-        team_members[team.slug] = {
-            login.casefold()
-            for login in client.list_team_members(
-                config.organisation,
-                team.slug,
-            )
-        }
         for desired_repository in group.repositories:
             repository = repositories_by_name.get(desired_repository.name)
             if repository is None:
@@ -1394,6 +1456,139 @@ def _failure_is_expiry(invitation: FailedInvitation) -> bool:
     return "expir" in reason
 
 
+def _members_for_team(snapshot: Snapshot, team: Team | None) -> list[TeamMember]:
+    if team is None:
+        return []
+    return snapshot.team_members.get(team.slug, [])
+
+
+def _member_logins(members: Sequence[TeamMember]) -> set[str]:
+    return {member.login.casefold() for member in members}
+
+
+def _direct_ordinary_members(members: Sequence[TeamMember]) -> list[TeamMember]:
+    return [
+        member
+        for member in members
+        if member.role == "member" and not member.inherited
+    ]
+
+
+def _resolve_student_identity(
+    config: Configuration,
+    student: Student,
+    snapshot: Snapshot,
+) -> IdentityResolution:
+    identity_group = _build_individual_group(config, student)
+    identity_team = snapshot.teams_by_name.get(identity_group.team_name)
+    identity_records = [
+        record
+        for record in snapshot.ledger.records
+        if (
+            record.student_id == student.student_id
+            and (
+                record.group_id == identity_group.group_id
+                or record.team_name.casefold()
+                == identity_group.team_name.casefold()
+            )
+        )
+        or record.team_name.casefold() == identity_group.team_name.casefold()
+    ]
+
+    for record in identity_records:
+        if (
+            record.student_id != student.student_id
+            or record.email.casefold() != student.email.casefold()
+            or record.group_id != identity_group.group_id
+            or record.team_name.casefold()
+            != identity_group.team_name.casefold()
+            or (
+                identity_team is not None
+                and record.team_id is not None
+                and record.team_id != identity_team.id
+            )
+        ):
+            return IdentityResolution(
+                state=IdentityResolutionState.UNRESOLVED,
+                team_name=identity_group.team_name,
+                team_slug=identity_team.slug if identity_team else None,
+                team_id=identity_team.id if identity_team else None,
+                reason=(
+                    "the individual-team ledger identity or numeric team ID "
+                    "conflicts with the roster or current GitHub team"
+                ),
+            )
+
+    if identity_team is None:
+        if identity_records:
+            return IdentityResolution(
+                state=IdentityResolutionState.UNRESOLVED,
+                team_name=identity_group.team_name,
+                reason=(
+                    "the ledger records an individual-team assignment, but the "
+                    "expected individual team is missing"
+                ),
+            )
+        return IdentityResolution(
+            state=IdentityResolutionState.ABSENT,
+            team_name=identity_group.team_name,
+            reason="no individual team or individual-team ledger history exists",
+        )
+
+    candidates = _direct_ordinary_members(
+        _members_for_team(snapshot, identity_team)
+    )
+    if not candidates:
+        return IdentityResolution(
+            state=IdentityResolutionState.UNRESOLVED,
+            team_name=identity_group.team_name,
+            team_slug=identity_team.slug,
+            team_id=identity_team.id,
+            reason=(
+                "the individual team exists but contains no direct active "
+                "non-maintainer member"
+            ),
+        )
+    if len(candidates) > 1:
+        return IdentityResolution(
+            state=IdentityResolutionState.UNRESOLVED,
+            team_name=identity_group.team_name,
+            team_slug=identity_team.slug,
+            team_id=identity_team.id,
+            reason=(
+                "the individual team contains multiple direct active "
+                "non-maintainer members"
+            ),
+        )
+
+    member = candidates[0]
+    if (
+        student.github_login is not None
+        and student.github_login.casefold() != member.login.casefold()
+    ):
+        return IdentityResolution(
+            state=IdentityResolutionState.UNRESOLVED,
+            team_name=identity_group.team_name,
+            team_slug=identity_team.slug,
+            team_id=identity_team.id,
+            reason=(
+                "the individual team's sole member does not match the verified "
+                "GitHub login in the roster"
+            ),
+        )
+    return IdentityResolution(
+        state=IdentityResolutionState.RESOLVED,
+        team_name=identity_group.team_name,
+        team_slug=identity_team.slug,
+        team_id=identity_team.id,
+        member=member,
+        reason=(
+            "the individual team's sole direct active non-maintainer member "
+            "resolved the student's GitHub identity"
+        ),
+    )
+
+
 def reconcile_invitation(
     student: Student,
     group: DesiredGroup,
@@ -1403,35 +1598,42 @@ def reconcile_invitation(
     if pending is not None:
         expected_team = snapshot.teams_by_name.get(group.team_name)
         pending_team_ids = snapshot.invitation_team_ids.get(pending.id, set())
-        assignment_note = ""
-        if expected_team is not None and expected_team.id not in pending_team_ids:
-            assignment_note = (
-                "; the expected team is not attached to the pending invitation, "
-                "so the mapping requires review"
+        if expected_team is None or expected_team.id not in pending_team_ids:
+            return InvitationDecision(
+                state=InvitationState.PENDING,
+                action_type=ActionType.REVIEW_REQUIRED,
+                reason=(
+                    "a pending organisation invitation already exists, but the "
+                    "expected team is not attached; the invitation will not be "
+                    "replaced or duplicated"
+                ),
             )
         return InvitationDecision(
             state=InvitationState.PENDING,
             action_type=ActionType.SKIP_PENDING_INVITATION,
             reason=(
-                "a pending organisation invitation already exists for this email" + assignment_note
+                "a pending organisation invitation already exists for this "
+                "email and contains the expected team assignment"
             ),
         )
 
     team = snapshot.teams_by_name.get(group.team_name)
-    members = snapshot.team_members.get(team.slug, set()) if team is not None else set()
-    if student.github_login and student.github_login.casefold() in members:
+    members = _members_for_team(snapshot, team)
+    member_logins = _member_logins(members)
+    if student.github_login and student.github_login.casefold() in member_logins:
         return InvitationDecision(
             state=InvitationState.ACCEPTED_CONFIRMED,
             action_type=ActionType.SKIP_ACCEPTED,
             reason="the verified GitHub login is an active member of the expected team",
         )
-    if group.individual and len(members) == 1:
+    individual_members = _direct_ordinary_members(members)
+    if group.individual and len(individual_members) == 1:
         return InvitationDecision(
             state=InvitationState.ACCEPTED_CONFIRMED,
             action_type=ActionType.SKIP_ACCEPTED,
             reason="the individual team contains one active non-maintainer member",
         )
-    if group.individual and len(members) > 1:
+    if group.individual and len(individual_members) > 1:
         return InvitationDecision(
             state=InvitationState.UNRESOLVED,
             action_type=ActionType.REVIEW_REQUIRED,
@@ -1651,7 +1853,8 @@ def reconcile_invitation_bundle(
         memberships = [
             (
                 team is not None
-                and login in snapshot.team_members.get(team.slug, set())
+                and login
+                in _member_logins(_members_for_team(snapshot, team))
             )
             for group in groups
             for team in [teams_by_name.get(group.team_name)]
@@ -1675,12 +1878,14 @@ def reconcile_invitation_bundle(
                 ),
             )
     else:
-        individual_member_sets: list[set[str]] = []
+        individual_member_sets: list[list[TeamMember]] = []
         for group in groups:
             if not group.individual:
                 continue
             team = teams_by_name.get(group.team_name)
-            members = snapshot.team_members.get(team.slug, set()) if team else set()
+            members = _direct_ordinary_members(
+                _members_for_team(snapshot, team)
+            )
             if len(members) > 1:
                 return InvitationDecision(
                     state=InvitationState.UNRESOLVED,
@@ -1692,7 +1897,7 @@ def reconcile_invitation_bundle(
                 )
             individual_member_sets.append(members)
         inferred_logins = {
-            next(iter(members))
+            members[0].login.casefold()
             for members in individual_member_sets
             if len(members) == 1
         }
@@ -1707,7 +1912,8 @@ def reconcile_invitation_bundle(
             memberships = [
                 (
                     team is not None
-                    and inferred_login in snapshot.team_members.get(team.slug, set())
+                    and inferred_login
+                    in _member_logins(_members_for_team(snapshot, team))
                 )
                 for group in groups
                 for team in [teams_by_name.get(group.team_name)]
@@ -1809,6 +2015,55 @@ def _invitation_action_id(group: DesiredGroup, student: Student) -> str:
     return f"{group.key}:invitation:{student.student_id}"
 
 
+def _membership_action_id(group: DesiredGroup, student: Student) -> str:
+    return f"{group.key}:membership:{student.student_id}"
+
+
+def _pending_contains_expected_bundle(
+    student: Student,
+    groups: Sequence[DesiredGroup],
+    snapshot: Snapshot,
+) -> bool:
+    pending = snapshot.pending_by_email.get(student.email.casefold())
+    if pending is None:
+        return False
+    attached_ids = snapshot.invitation_team_ids.get(pending.id, set())
+    return all(
+        (team := snapshot.teams_by_name.get(group.team_name)) is not None
+        and team.id in attached_ids
+        for group in groups
+    )
+
+
+def _membership_mapping_conflict(
+    student: Student,
+    group: DesiredGroup,
+    team: Team | None,
+    snapshot: Snapshot,
+) -> str | None:
+    matching_team_records = [
+        record
+        for record in snapshot.ledger.records
+        if record.team_name.casefold() == group.team_name.casefold()
+    ]
+    for record in matching_team_records:
+        if (
+            record.student_id != student.student_id
+            or record.email.casefold() != student.email.casefold()
+            or record.group_id != group.group_id
+            or (
+                record.team_id is not None
+                and team is not None
+                and record.team_id != team.id
+            )
+        ):
+            return (
+                "the shared-team ledger identity or numeric team ID conflicts "
+                "with the roster or current GitHub team"
+            )
+    return None
+
+
 def _record_is_part_of_multi_team_invitation(
     student: Student,
     group: DesiredGroup,
@@ -1870,7 +2125,7 @@ def build_provision_plan(
     team_actions: list[Action] = []
     repository_actions: list[Action] = []
     permission_actions: list[Action] = []
-    invitation_actions: list[Action] = []
+    student_actions: list[Action] = []
     group_dependencies: dict[str, list[str]] = {}
 
     for group in groups:
@@ -2121,6 +2376,214 @@ def build_provision_plan(
             deduplicated_groups.append(group)
         ordered_groups = deduplicated_groups
 
+        shared_groups = [group for group in ordered_groups if not group.individual]
+        if shared_groups and not retry_expired:
+            identity = _resolve_student_identity(config, student, snapshot)
+            if (
+                identity.state == IdentityResolutionState.RESOLVED
+                and identity.member is not None
+            ):
+                for shared_group in shared_groups:
+                    shared_team = teams_by_name.get(shared_group.team_name)
+                    mapping_conflict = _membership_mapping_conflict(
+                        student,
+                        shared_group,
+                        shared_team,
+                        snapshot,
+                    )
+                    if mapping_conflict is not None:
+                        student_actions.append(
+                            Action(
+                                action_id=_membership_action_id(
+                                    shared_group,
+                                    student,
+                                ),
+                                action_type=ActionType.REVIEW_REQUIRED,
+                                scope=shared_group.key,
+                                student_id=student.student_id,
+                                email=student.email,
+                                github_login=identity.member.login,
+                                github_user_id=identity.member.id,
+                                group_id=shared_group.group_id,
+                                team_name=shared_group.team_name,
+                                team_slug=(
+                                    shared_team.slug if shared_team else None
+                                ),
+                                team_id=shared_team.id if shared_team else None,
+                                identity_team_name=identity.team_name,
+                                identity_team_slug=identity.team_slug,
+                                identity_team_id=identity.team_id,
+                                invitation_state=InvitationState.UNRESOLVED,
+                                desired_state=(
+                                    "resolved GitHub account is an active shared "
+                                    "team member"
+                                ),
+                                reason=mapping_conflict,
+                                status=ActionStatus.REVIEW,
+                            )
+                        )
+                        continue
+
+                    existing_membership = next(
+                        (
+                            member
+                            for member in _members_for_team(
+                                snapshot,
+                                shared_team,
+                            )
+                            if member.id == identity.member.id
+                        ),
+                        None,
+                    )
+                    if existing_membership is not None:
+                        student_actions.append(
+                            Action(
+                                action_id=_membership_action_id(
+                                    shared_group,
+                                    student,
+                                ),
+                                action_type=ActionType.SKIP_ACCEPTED,
+                                scope=shared_group.key,
+                                student_id=student.student_id,
+                                email=student.email,
+                                github_login=existing_membership.login,
+                                github_user_id=existing_membership.id,
+                                group_id=shared_group.group_id,
+                                team_name=shared_group.team_name,
+                                team_slug=(
+                                    shared_team.slug if shared_team else None
+                                ),
+                                team_id=shared_team.id if shared_team else None,
+                                identity_team_name=identity.team_name,
+                                identity_team_slug=identity.team_slug,
+                                identity_team_id=identity.team_id,
+                                invitation_state=(
+                                    InvitationState.ACCEPTED_CONFIRMED
+                                ),
+                                current_state=(
+                                    "resolved GitHub user is already active in "
+                                    f"the shared team as {existing_membership.role}"
+                                ),
+                                desired_state=(
+                                    "resolved GitHub account is an active shared "
+                                    "team member"
+                                ),
+                                reason=(
+                                    "the individual team resolved the student, "
+                                    "and the same numeric GitHub user ID is "
+                                    "already active in the shared team"
+                                ),
+                                status=ActionStatus.SKIPPED,
+                            )
+                        )
+                        continue
+
+                    student_actions.append(
+                        Action(
+                            action_id=_membership_action_id(
+                                shared_group,
+                                student,
+                            ),
+                            action_type=ActionType.ADD_TEAM_MEMBER,
+                            scope=shared_group.key,
+                            student_id=student.student_id,
+                            email=student.email,
+                            github_login=identity.member.login,
+                            github_user_id=identity.member.id,
+                            group_id=shared_group.group_id,
+                            team_name=shared_group.team_name,
+                            team_slug=shared_team.slug if shared_team else None,
+                            team_id=shared_team.id if shared_team else None,
+                            identity_team_name=identity.team_name,
+                            identity_team_slug=identity.team_slug,
+                            identity_team_id=identity.team_id,
+                            invitation_state=(
+                                InvitationState.ACCEPTED_CONFIRMED
+                            ),
+                            current_state=(
+                                "resolved GitHub user is not active in the "
+                                "shared team"
+                            ),
+                            desired_state=(
+                                "resolved GitHub account is an active shared "
+                                "team member"
+                            ),
+                            reason=(
+                                f"{identity.reason}; no organisation invitation "
+                                "is required"
+                            ),
+                            dependencies=list(
+                                group_dependencies[shared_group.key]
+                            ),
+                        )
+                    )
+                continue
+
+            explicit_empty_identity = (
+                any(group.individual for group in ordered_groups)
+                and (
+                    identity_team := teams_by_name.get(identity.team_name)
+                )
+                is not None
+                and not _members_for_team(snapshot, identity_team)
+                and not any(
+                    record.team_name.casefold()
+                    == identity.team_name.casefold()
+                    or (
+                        record.student_id == student.student_id
+                        and record.group_id == f"IND-{student.student_id}"
+                    )
+                    for record in snapshot.ledger.records
+                )
+            )
+            if (
+                identity.state == IdentityResolutionState.UNRESOLVED
+                and not explicit_empty_identity
+                and not _pending_contains_expected_bundle(
+                    student,
+                    ordered_groups,
+                    snapshot,
+                )
+            ):
+                primary_group = shared_groups[0]
+                primary_team = teams_by_name.get(primary_group.team_name)
+                pending_invitation = snapshot.pending_by_email.get(
+                    student.email.casefold()
+                )
+                student_actions.append(
+                    Action(
+                        action_id=_membership_action_id(primary_group, student),
+                        action_type=ActionType.REVIEW_REQUIRED,
+                        scope=primary_group.key,
+                        student_id=student.student_id,
+                        email=student.email,
+                        github_login=student.github_login,
+                        group_id=primary_group.group_id,
+                        team_name=primary_group.team_name,
+                        team_slug=primary_team.slug if primary_team else None,
+                        team_id=primary_team.id if primary_team else None,
+                        identity_team_name=identity.team_name,
+                        identity_team_slug=identity.team_slug,
+                        identity_team_id=identity.team_id,
+                        invitation_id=(
+                            pending_invitation.id
+                            if pending_invitation is not None
+                            else None
+                        ),
+                        invitation_state=InvitationState.UNRESOLVED,
+                        desired_state=(
+                            "student identity safely resolved before shared "
+                            "team assignment"
+                        ),
+                        reason=(
+                            f"{identity.reason}; no replacement organisation "
+                            "invitation or direct membership write will be sent"
+                        ),
+                        status=ActionStatus.REVIEW,
+                    )
+                )
+                continue
+
         decision = reconcile_invitation_bundle(student, ordered_groups, snapshot)
         pending_invitation = snapshot.pending_by_email.get(student.email.casefold())
         action_type = decision.action_type
@@ -2209,7 +2672,7 @@ def build_provision_plan(
                     if dependency not in invitation_dependencies:
                         invitation_dependencies.append(dependency)
 
-        invitation_actions.append(
+        student_actions.append(
             Action(
                 action_id=_invitation_action_id(primary_group, student),
                 action_type=action_type,
@@ -2263,7 +2726,7 @@ def build_provision_plan(
             *team_actions,
             *repository_actions,
             *permission_actions,
-            *invitation_actions,
+            *student_actions,
         ],
     )
 
@@ -2893,6 +3356,111 @@ def execute_plan(
                     action.repository,
                     config.repositories.permission.value,
                 )
+            elif action.action_type == ActionType.ADD_TEAM_MEMBER:
+                if (
+                    action.team_name is None
+                    or action.identity_team_name is None
+                    or action.identity_team_id is None
+                    or action.github_user_id is None
+                ):
+                    raise RuntimeError(
+                        "ADD_TEAM_MEMBER action lacks a resolved source identity "
+                        "or destination team"
+                    )
+
+                live_teams = {
+                    team.name: team
+                    for team in client.list_teams(config.organisation)
+                }
+                identity_team = live_teams.get(action.identity_team_name)
+                if (
+                    identity_team is None
+                    or identity_team.id != action.identity_team_id
+                ):
+                    raise GitHubResponseError(
+                        "the individual identity team is missing or has a "
+                        "different numeric ID; no membership write was attempted",
+                        operation=(
+                            f"revalidate identity team "
+                            f"{action.identity_team_name}"
+                        ),
+                    )
+                action.identity_team_slug = identity_team.slug
+                identity_candidates = _direct_ordinary_members(
+                    client.list_team_members(
+                        config.organisation,
+                        identity_team.slug,
+                    )
+                )
+                if (
+                    len(identity_candidates) != 1
+                    or identity_candidates[0].id != action.github_user_id
+                ):
+                    raise GitHubResponseError(
+                        "the individual identity team no longer contains the "
+                        "same sole direct active non-maintainer member; no "
+                        "membership write was attempted",
+                        operation=(
+                            f"revalidate identity member for "
+                            f"{action.identity_team_name}"
+                        ),
+                    )
+
+                identity_member = identity_candidates[0]
+                action.github_login = identity_member.login
+                planned_team = teams.get(action.team_name)
+                live_target_team = live_teams.get(action.team_name)
+                if (
+                    planned_team is not None
+                    and live_target_team is not None
+                    and planned_team.id != live_target_team.id
+                ):
+                    raise GitHubResponseError(
+                        "the destination shared team has a different numeric "
+                        "ID from the completed plan; no membership write was "
+                        "attempted",
+                        operation=(
+                            f"revalidate destination team {action.team_name}"
+                        ),
+                    )
+                resolved_team = live_target_team or planned_team
+                if resolved_team is None:
+                    raise RuntimeError(
+                        f"Resolved team is unavailable for {action.action_id}"
+                    )
+                action.team_id = resolved_team.id
+                action.team_slug = resolved_team.slug
+                target_members = client.list_team_members(
+                    config.organisation,
+                    resolved_team.slug,
+                )
+                if any(
+                    member.id == action.github_user_id
+                    for member in target_members
+                ):
+                    action.status = ActionStatus.SKIPPED
+                    action.reason = (
+                        "the resolved GitHub user became active in the shared "
+                        "team before this action executed"
+                    )
+                    outcomes[action.action_id] = True
+                    continue
+
+                membership = client.add_team_member(
+                    config.organisation,
+                    resolved_team.slug,
+                    identity_member.login,
+                )
+                if membership.state != "active":
+                    raise GitHubResponseError(
+                        "GitHub returned a pending team membership even though "
+                        "the individual team proves the account is already an "
+                        "organisation member",
+                        operation=(
+                            f"add {identity_member.login} to team "
+                            f"{config.organisation}/{resolved_team.slug}"
+                        ),
+                    )
             elif action.action_type == ActionType.SEND_INVITATION:
                 if action.email is None:
                     raise RuntimeError("SEND_INVITATION action is incomplete")
@@ -2963,6 +3531,32 @@ def execute_plan(
         except GitHubError as exc:
             adopted: Invitation | None = None
             failure_reason = str(exc)
+            if (
+                isinstance(exc, GitHubNetworkError)
+                and action.action_type == ActionType.ADD_TEAM_MEMBER
+                and action.team_slug is not None
+                and action.github_user_id is not None
+            ):
+                try:
+                    recovered_members = client.list_team_members(
+                        config.organisation,
+                        action.team_slug,
+                    )
+                except GitHubError:
+                    recovered_members = []
+                if any(
+                    member.id == action.github_user_id
+                    for member in recovered_members
+                ):
+                    action.status = ActionStatus.SUCCEEDED
+                    action.reason = (
+                        "the membership request returned a network error, but "
+                        "the expected numeric GitHub user ID is active in the "
+                        "destination team"
+                    )
+                    outcomes[action.action_id] = True
+                    successful_writes += 1
+                    continue
             if (
                 isinstance(exc, GitHubNetworkError)
                 and action.action_type == ActionType.SEND_INVITATION
@@ -3137,6 +3731,28 @@ def verify_execution(
                             f"{permission!r}, expected "
                             f"{config.repositories.permission.value!r}"
                         )
+            elif action.action_type == ActionType.ADD_TEAM_MEMBER:
+                if (
+                    action.team_slug is None
+                    or action.github_user_id is None
+                ):
+                    error = (
+                        "membership action lacks a resolved team or numeric "
+                        "GitHub user ID"
+                    )
+                else:
+                    members = client.list_team_members(
+                        config.organisation,
+                        action.team_slug,
+                    )
+                    if not any(
+                        member.id == action.github_user_id
+                        for member in members
+                    ):
+                        error = (
+                            "resolved GitHub user ID was not active in the "
+                            "destination team during verification"
+                        )
             elif action.action_type == ActionType.ARCHIVE_REPOSITORY:
                 repository = (
                     repositories.get(action.repository) if action.repository is not None else None
@@ -3190,10 +3806,15 @@ def verify_execution(
                         scope=action.scope,
                         student_id=action.student_id,
                         email=action.email,
+                        github_login=action.github_login,
+                        github_user_id=action.github_user_id,
                         group_id=action.group_id,
                         team_name=action.team_name,
                         team_slug=action.team_slug,
                         team_id=action.team_id,
+                        identity_team_name=action.identity_team_name,
+                        identity_team_slug=action.identity_team_slug,
+                        identity_team_id=action.identity_team_id,
                         repository=action.repository,
                         reason=error,
                         status=ActionStatus.FAILED,
@@ -3261,6 +3882,7 @@ _ACTION_LABELS: dict[ActionType, str] = {
     ActionType.CREATE_REPOSITORY: "Create repositories",
     ActionType.GRANT_TEAM_REPOSITORY: "Grant repository access",
     ActionType.UPDATE_TEAM_REPOSITORY_PERMISSION: "Update repository permissions",
+    ActionType.ADD_TEAM_MEMBER: "Add team members",
     ActionType.SEND_INVITATION: "Send invitations",
     ActionType.SKIP_PENDING_INVITATION: "Pending invitations skipped",
     ActionType.SKIP_ACCEPTED: "Accepted or inferred skipped",
@@ -3284,6 +3906,7 @@ def terminal_summary_lines(plan: Plan) -> list[str]:
         ActionType.CREATE_REPOSITORY,
         ActionType.GRANT_TEAM_REPOSITORY,
         ActionType.UPDATE_TEAM_REPOSITORY_PERMISSION,
+        ActionType.ADD_TEAM_MEMBER,
         ActionType.SEND_INVITATION,
         ActionType.SKIP_PENDING_INVITATION,
         ActionType.SKIP_ACCEPTED,
@@ -3321,10 +3944,15 @@ def _action_detail(action: Action) -> list[str]:
         ("Status", action.status.value),
         ("Student ID", action.student_id),
         ("Email", action.email),
+        ("GitHub login", action.github_login),
+        ("GitHub user ID", action.github_user_id),
         ("Group", action.group_id),
         ("Team", action.team_name),
         ("Team slug", action.team_slug),
         ("Team ID", action.team_id),
+        ("Identity team", action.identity_team_name),
+        ("Identity team slug", action.identity_team_slug),
+        ("Identity team ID", action.identity_team_id),
         ("Repository", action.repository),
         ("Invitation state", action.invitation_state.value if action.invitation_state else None),
         ("Current state", action.current_state),

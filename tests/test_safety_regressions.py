@@ -34,6 +34,7 @@ from gh_edu.github import (
     GitHubNetworkError,
     Repository,
     Team,
+    TeamMember,
 )
 
 
@@ -182,7 +183,7 @@ def test_wrong_team_pending_invitation_is_recorded_failed_then_requires_review(
     )
     invitation_action = next(action for action in plan.actions if action.student_id)
 
-    assert invitation_action.action_type == ActionType.SKIP_PENDING_INVITATION
+    assert invitation_action.action_type == ActionType.REVIEW_REQUIRED
     assert "expected team is not attached" in invitation_action.reason
     outcome = execute_plan(
         plan,
@@ -641,7 +642,16 @@ def test_exact_expired_failure_evidence_outranks_shared_team_inference(
                 failed_reason="Invitation expired",
             )
         ],
-        team_members={team.slug: {"unmapped-member"}},
+        team_members={
+            team.slug: [
+                TeamMember(
+                    id=1,
+                    login="unmapped-member",
+                    role="member",
+                    inherited=False,
+                )
+            ]
+        },
         permissions={},
         ledger=InvitationLedger(
             organisation="teaching-org",
@@ -682,7 +692,7 @@ def test_stale_failed_email_without_ledger_is_not_retryable(
                 failed_reason="Invitation expired",
             )
         ],
-        team_members={team.slug: set()},
+        team_members={team.slug: []},
         permissions={f"{team.slug}\0{repository.name.casefold()}": "push"},
         ledger=InvitationLedger(organisation=config.organisation),
     )
@@ -728,7 +738,7 @@ def test_changed_email_for_same_student_is_unresolved(
         repositories=[Repository(name=group.repositories[0].name)],
         pending_invitations=[],
         failed_invitations=[],
-        team_members={team.slug: set()},
+        team_members={team.slug: []},
         permissions={},
         ledger=InvitationLedger(
             organisation="teaching-org",

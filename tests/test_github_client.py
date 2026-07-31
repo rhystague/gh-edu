@@ -231,6 +231,117 @@ def test_invitation_team_lookup_returns_numeric_ids(
     assert "--slurp" in args
 
 
+def test_team_member_listing_returns_stable_identity_and_membership_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout=json.dumps(
+                    [
+                        [
+                            {
+                                "id": 501,
+                                "login": "Student-Login",
+                                "role": "member",
+                                "inherited": False,
+                            },
+                            {
+                                "id": 502,
+                                "login": "course-maintainer",
+                                "role": "maintainer",
+                                "inherited": True,
+                            },
+                        ]
+                    ]
+                )
+            )
+        ],
+    )
+
+    members = GhCliClient().list_team_members("teaching-org", "identity-team")
+
+    assert [
+        (member.id, member.login, member.role, member.inherited)
+        for member in members
+    ] == [
+        (501, "Student-Login", "member", False),
+        (502, "course-maintainer", "maintainer", True),
+    ]
+    args = calls[0][0]
+    assert (
+        "/orgs/teaching-org/teams/identity-team/members"
+        "?role=all&per_page=100"
+    ) in args
+    assert "--paginate" in args
+    assert "--slurp" in args
+
+
+def test_add_team_member_uses_current_login_and_parses_active_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout=json.dumps(
+                    {
+                        "role": "member",
+                        "state": "active",
+                    }
+                )
+            )
+        ],
+    )
+
+    membership = GhCliClient().add_team_member(
+        "teaching-org",
+        "group-team",
+        "Student Login/With Slash",
+    )
+
+    assert membership.role == "member"
+    assert membership.state == "active"
+    args = calls[0][0]
+    assert args[:3] == [
+        "gh",
+        "api",
+        (
+            "/orgs/teaching-org/teams/group-team/memberships/"
+            "Student%20Login%2FWith%20Slash"
+        ),
+    ]
+    assert args[args.index("--method") + 1] == "PUT"
+    assert "role=member" in args
+
+
+def test_add_team_member_preserves_pending_response_for_core_safety_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout=json.dumps(
+                    {
+                        "role": "member",
+                        "state": "pending",
+                    }
+                )
+            )
+        ],
+    )
+
+    membership = GhCliClient().add_team_member(
+        "teaching-org",
+        "group-team",
+        "student-login",
+    )
+
+    assert membership.state == "pending"
+
+
 def test_permission_404_means_absent_only_for_known_team_and_repository(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
