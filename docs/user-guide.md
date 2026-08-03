@@ -52,17 +52,69 @@ Use this operating sequence for every mutating command:
 Before provisioning:
 
 1. Install Python 3.11 or later.
-2. Install and authenticate the GitHub CLI:
-
-   ```console
-   gh auth login
-   gh auth status
-   ```
-
-3. Confirm the authenticated account can administer the target organisation.
+2. Install the GitHub CLI.
+3. Confirm the authenticated account is an owner of the target organisation.
 4. Create or select a GitHub template repository and enable its template
    repository setting.
 5. Prepare the term configuration and CSV rosters.
+
+### GitHub authentication
+
+The supported interactive setup uses a browser-based credential stored by the
+GitHub CLI. For a fresh login, request the complete supported scope set:
+
+```console
+gh auth login --hostname github.com --web --scopes admin:org,read:org,repo
+```
+
+If the active account already has a stored login, add the organisation scope
+without replacing its existing scopes:
+
+```console
+gh auth refresh --hostname github.com --scopes admin:org
+```
+
+GitHub CLI retains `repo`, `read:org`, and `gist` as its minimum stored-token
+scopes. `gh-edu` uses the following subset plus `admin:org`:
+
+| Scope | Required capability |
+|---|---|
+| `repo` | Read source templates and create or manage private cohort repositories. |
+| `read:org` | Discover organisation membership, teams, invitations, and related state. |
+| `admin:org` | Create and manage teams and send organisation invitations. |
+
+The `gist` scope is a GitHub CLI minimum but is not used by `gh-edu`. Sending
+organisation invitations also requires the authenticated account to be an
+organisation owner; the token scope does not replace that role requirement.
+
+Verify the active account and its reported scopes, then run the application
+check:
+
+```console
+gh auth status --active --hostname github.com
+gh-edu auth check --config config.yml
+```
+
+Do not use `gh auth status --show-token` in logs, reports, screenshots, or
+support transcripts because that option prints the credential. The ordinary
+status command above does not request the token value. Never put a GitHub token
+in configuration, rosters, reports, or command arguments.
+
+`GH_TOKEN` or `GITHUB_TOKEN` can take precedence over a stored GitHub CLI
+credential. `gh auth refresh` changes only the stored credential; it does not
+expand an environment-provided or fine-grained token. The stored browser-based
+credential is the supported operator setup documented here. Automation tokens
+must independently provide equivalent access to the target organisation and
+repositories.
+
+If the organisation enforces SAML SSO, authorise the GitHub CLI OAuth
+credential for that organisation when prompted. GitHub can otherwise reject
+API access even when the account role and OAuth scopes are correct.
+
+The current `gh-edu auth check` confirms an active GitHub CLI account and owner
+membership of the configured organisation. It does not yet inspect the
+credential's OAuth scope list, so review the scopes reported by
+`gh auth status` before a dry run or apply.
 
 Install `gh-edu` from this repository:
 
@@ -82,8 +134,8 @@ ruff check .
 mypy
 ```
 
-`gh-edu` uses the existing `gh` authentication. Do not put a GitHub token in
-the YAML configuration.
+`gh-edu` uses the existing `gh` authentication. It never needs a token in the
+YAML configuration.
 
 ## Configuration
 

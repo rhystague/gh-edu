@@ -29,13 +29,38 @@ manage supervisors, or remove organisation members.
 
 - Python 3.11 or later
 - [GitHub CLI](https://cli.github.com/) installed and authenticated
-- Organisation administration access
+- Owner access to the target organisation
 - A repository with GitHub's template-repository setting enabled
 
+For a fresh browser-based GitHub CLI login, request the supported scope set:
+
 ```console
-gh auth login
-python -m pip install .
+gh auth login --hostname github.com --web --scopes admin:org,read:org,repo
+```
+
+If GitHub CLI already has a stored login, add the missing organisation scope
+without replacing its existing scopes:
+
+```console
+gh auth refresh --hostname github.com --scopes admin:org
+```
+
+Verify the active account without displaying its token, then run the `gh-edu`
+authentication check:
+
+```console
+gh auth status --active --hostname github.com
 gh-edu auth check --config config.yml
+```
+
+Do not use `gh auth status --show-token` in logs or support transcripts. See
+the [user-guide authentication contract](docs/user-guide.md#github-authentication)
+for scope purposes, environment-token precedence, and SAML SSO requirements.
+
+Install `gh-edu` after authentication:
+
+```console
+python -m pip install .
 ```
 
 The `template` setting uses `owner/repository` syntax. For example,
