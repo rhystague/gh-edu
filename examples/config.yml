@@ -25,6 +25,7 @@ paths:
 execution:
   content_writes_per_hour: 450
   invitation_budget_per_24_hours: auto
+  github_timeout_seconds: 180
 
 roster:
   github_login_column: github_login

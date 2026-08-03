@@ -94,6 +94,11 @@ both workflows; set it to `null` when verified logins are unavailable.
 
 ## Large cohorts
 
+Each complete GitHub CLI invocation has a configurable 180-second deadline,
+including paginated discovery. Set `execution.github_timeout_seconds` in YAML
+or use `--github-timeout-seconds N` on a GitHub-backed command for a one-run
+override.
+
 GitHub mutations are separated by at least one second. `gh-edu` also enforces
 buffered rolling budgets of 450 content writes per hour and, automatically, 45
 or 450 invitations per 24 hours according to the organisation metadata.

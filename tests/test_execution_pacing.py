@@ -395,6 +395,24 @@ def test_invalid_content_write_budget_is_rejected(config_factory, value) -> None
         )
 
 
+def test_github_timeout_defaults_and_accepts_configured_value(config_factory) -> None:
+    default_config = load_configuration(config_factory())
+    configured = load_configuration(
+        config_factory(overrides={"execution": {"github_timeout_seconds": 240}})
+    )
+
+    assert default_config.execution.github_timeout_seconds == 180
+    assert configured.execution.github_timeout_seconds == 240
+
+
+@pytest.mark.parametrize("value", [0, -1, 3601, True, 180.5, "180"])
+def test_invalid_github_timeout_is_rejected(config_factory, value) -> None:
+    with pytest.raises(InputValidationError, match="github_timeout_seconds"):
+        load_configuration(
+            config_factory(overrides={"execution": {"github_timeout_seconds": value}})
+        )
+
+
 def test_execution_state_path_validation_and_locking(config_factory) -> None:
     config_path = config_factory()
     config = load_configuration(config_path)

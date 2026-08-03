@@ -119,6 +119,7 @@ paths:
 execution:
   content_writes_per_hour: 450
   invitation_budget_per_24_hours: auto
+  github_timeout_seconds: 180
 
 roster:
   github_login_column: null
@@ -143,6 +144,7 @@ The top-level and nested settings are:
 | `paths.execution_state` | Atomic, organisation-scoped write-attempt state used for rolling budgets. |
 | `execution.content_writes_per_hour` | Local rolling content-write budget, from `1` to `450`; default `450`. |
 | `execution.invitation_budget_per_24_hours` | `auto`, or an explicit local rolling invitation budget from `1` to `500`. |
+| `execution.github_timeout_seconds` | Deadline for each complete GitHub CLI invocation, from `1` to `3600`; default `180`. |
 | `roster.github_login_column` | Optional CSV column containing trusted, verified GitHub logins. |
 
 The slash in `template: teaching-org/course-template` separates the GitHub
@@ -288,6 +290,10 @@ All commands that accept `--apply` default to dry-run mode. Use
 only how an already reviewed apply handles pacing windows; it does not imply
 `--apply` and does not authorize new actions.
 
+Every command that contacts GitHub accepts `--github-timeout-seconds`. This
+temporarily overrides `execution.github_timeout_seconds`; roster validation
+does not expose the option because it performs no GitHub calls.
+
 `--config FILE` is required by every command. Roster-based commands also
 require `--roster FILE`. `provision individual` instead requires
 `--student-id`, `--email`, and the exact target `--repository`. It is the
@@ -322,8 +328,32 @@ Review that plan, then repeat it with `--apply` and, for a large retry batch,
 
 ## Large cohorts and GitHub limits
 
-Large cohorts are normal, but GitHub applies more than one limit to the writes
-they generate. `gh-edu` treats these as scheduling constraints:
+Each GitHub CLI invocation has a default 180-second deadline. A paginated
+`gh api --paginate --slurp` discovery fetches its pages sequentially inside one
+invocation, so the deadline covers the complete paginated command. It is reset
+for the next GitHub CLI invocation and is not a total-run timeout.
+
+For an organisation whose discovery needs longer, change the durable setting:
+
+```yaml
+execution:
+  github_timeout_seconds: 300
+```
+
+Or override it for one command without editing YAML:
+
+```console
+gh-edu status \
+  --config config.yml \
+  --roster groups.csv \
+  --github-timeout-seconds 300
+```
+
+Values must be whole seconds from 1 to 3600. A timeout error names the GitHub
+operation and effective deadline and repeats both remediation choices.
+
+Large cohorts can also encounter GitHub write limits. `gh-edu` treats these as
+scheduling constraints:
 
 - Every `POST`, `PUT`, `PATCH`, or `DELETE` is followed by at least one second
   before the next mutation begins. Reads and dry runs are unthrottled.

@@ -152,6 +152,18 @@ WaitForLimitsOption = Annotated[
         help="Wait through hourly, daily, and GitHub-provided rate-limit windows.",
     ),
 ]
+GitHubTimeoutOption = Annotated[
+    int | None,
+    typer.Option(
+        "--github-timeout-seconds",
+        min=1,
+        max=3600,
+        help=(
+            "Maximum seconds for each complete GitHub CLI invocation; overrides "
+            "execution.github_timeout_seconds."
+        ),
+    ),
+]
 
 
 class ConsoleProgress:
@@ -202,10 +214,18 @@ class ConsoleProgress:
             self.live_line = False
 
 
-def make_client(_config: Configuration) -> GitHubClient:
+def make_client(
+    config: Configuration,
+    github_timeout_seconds: int | None = None,
+) -> GitHubClient:
     """Construct the production client; tests replace this function."""
 
-    return GhCliClient()
+    timeout = (
+        config.execution.github_timeout_seconds
+        if github_timeout_seconds is None
+        else github_timeout_seconds
+    )
+    return GhCliClient(timeout=timeout)
 
 
 def _version_callback(value: bool) -> None:
@@ -351,12 +371,15 @@ def _apply_and_report(
 
 
 @auth_app.command("check")
-def auth_check(config_path: ConfigOption) -> None:
+def auth_check(
+    config_path: ConfigOption,
+    github_timeout_seconds: GitHubTimeoutOption = None,
+) -> None:
     """Check active GitHub CLI authentication and organisation ownership."""
 
     try:
         config = load_configuration(config_path)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         login = client.check_auth()
         client.check_organisation(config.organisation)
         typer.echo(
@@ -438,14 +461,18 @@ def roster_validate(
 
 
 @app.command("status")
-def status(config_path: ConfigOption, roster_path: RosterOption) -> None:
+def status(
+    config_path: ConfigOption,
+    roster_path: RosterOption,
+    github_timeout_seconds: GitHubTimeoutOption = None,
+) -> None:
     """Discover current resources and invitation states without writing GitHub."""
 
     try:
         config, _roster, groups = _load_group_inputs(config_path, roster_path)
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(client, config, groups, ledger)
         plan = build_provision_plan(
@@ -467,6 +494,7 @@ def status(config_path: ConfigOption, roster_path: RosterOption) -> None:
 def provision_groups(
     config_path: ConfigOption,
     roster_path: RosterOption,
+    github_timeout_seconds: GitHubTimeoutOption = None,
     add_individual: AddIndividualOption = False,
     apply: ApplyOption = False,
     wait_for_limits: WaitForLimitsOption = False,
@@ -481,7 +509,7 @@ def provision_groups(
         )
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(client, config, groups, ledger)
         plan = build_provision_plan(
@@ -525,6 +553,7 @@ def provision_individual(
         str,
         typer.Option("--repository", help="Exact individual repository name."),
     ],
+    github_timeout_seconds: GitHubTimeoutOption = None,
     apply: ApplyOption = False,
     wait_for_limits: WaitForLimitsOption = False,
 ) -> None:
@@ -541,7 +570,7 @@ def provision_individual(
         groups = [group]
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(client, config, groups, ledger)
         plan = build_provision_plan(
@@ -581,6 +610,7 @@ def provision_individual(
 def provision_individuals(
     config_path: ConfigOption,
     roster_path: RosterOption,
+    github_timeout_seconds: GitHubTimeoutOption = None,
     add_repository: AddRepositoryOption = False,
     apply: ApplyOption = False,
     wait_for_limits: WaitForLimitsOption = False,
@@ -602,7 +632,7 @@ def provision_individuals(
         )
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(
             client,
@@ -648,6 +678,7 @@ def provision_individuals(
 def retry_expired(
     config_path: ConfigOption,
     roster_path: RosterOption,
+    github_timeout_seconds: GitHubTimeoutOption = None,
     add_individual: AddIndividualOption = False,
     apply: ApplyOption = False,
     wait_for_limits: WaitForLimitsOption = False,
@@ -662,7 +693,7 @@ def retry_expired(
         )
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(
             client,
@@ -710,6 +741,7 @@ def retry_expired(
 def semester_close(
     config_path: ConfigOption,
     roster_path: RosterOption,
+    github_timeout_seconds: GitHubTimeoutOption = None,
     archive_repositories: Annotated[
         bool,
         typer.Option(
@@ -748,7 +780,7 @@ def semester_close(
             )
         ledger_file = ledger_path(config_path, config)
         ledger = load_ledger(ledger_file, config.organisation)
-        client = make_client(config)
+        client = make_client(config, github_timeout_seconds)
         typer.echo("Discovering GitHub state...")
         snapshot = discover_snapshot(
             client,

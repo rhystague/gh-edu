@@ -597,7 +597,10 @@ def patch_cli_client(
         def make_test_pacer(**kwargs):
             return ExecutionPacer(**kwargs, now=now, sleep=sleep)
 
-        monkeypatch.setattr("gh_edu.cli.make_client", lambda _config: client)
+        monkeypatch.setattr(
+            "gh_edu.cli.make_client",
+            lambda _config, _github_timeout_seconds=None: client,
+        )
         monkeypatch.setattr("gh_edu.cli.ExecutionPacer", make_test_pacer)
 
     return patch

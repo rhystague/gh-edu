@@ -39,6 +39,7 @@ from pydantic import (
 )
 
 from gh_edu.github import (
+    DEFAULT_GITHUB_TIMEOUT_SECONDS,
     FailedInvitation,
     GitHubAuthError,
     GitHubClient,
@@ -215,6 +216,12 @@ class PathsSettings(StrictModel):
 class ExecutionSettings(StrictModel):
     content_writes_per_hour: int = Field(default=450, strict=True, ge=1, le=450)
     invitation_budget_per_24_hours: Literal["auto"] | int = "auto"
+    github_timeout_seconds: int = Field(
+        default=DEFAULT_GITHUB_TIMEOUT_SECONDS,
+        strict=True,
+        ge=1,
+        le=3600,
+    )
 
     @field_validator("invitation_budget_per_24_hours", mode="before")
     @classmethod

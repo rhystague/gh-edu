@@ -75,6 +75,115 @@ def test_mutating_command_help_exposes_wait_for_limits(runner) -> None:
         assert "--wait-for-limits" in result.stdout
 
 
+def test_github_backed_command_help_exposes_timeout_override(runner) -> None:
+    from gh_edu.cli import app
+
+    commands = [
+        ["auth", "check", "--help"],
+        ["status", "--help"],
+        ["provision", "groups", "--help"],
+        ["provision", "individual", "--help"],
+        ["provision", "individuals", "--help"],
+        ["invitations", "retry-expired", "--help"],
+        ["semester", "close", "--help"],
+    ]
+
+    for command in commands:
+        result = runner.invoke(app, command, terminal_width=120)
+        assert result.exit_code == 0
+        assert "--github-timeout-sec" in result.stdout
+
+    roster_help = runner.invoke(
+        app,
+        ["roster", "validate", "--help"],
+        terminal_width=120,
+    )
+    assert roster_help.exit_code == 0
+    assert "--github-timeout-sec" not in roster_help.stdout
+
+
+def test_make_client_resolves_config_timeout_and_cli_override(
+    monkeypatch,
+    config_factory,
+) -> None:
+    from gh_edu.cli import make_client
+
+    configured_timeouts: list[int] = []
+
+    def record_client(*, timeout):
+        configured_timeouts.append(timeout)
+        return object()
+
+    monkeypatch.setattr("gh_edu.cli.GhCliClient", record_client)
+    config = load_configuration(
+        config_factory(overrides={"execution": {"github_timeout_seconds": 240}})
+    )
+
+    make_client(config)
+    make_client(config, 360)
+
+    assert configured_timeouts == [240, 360]
+
+
+def test_status_passes_timeout_override_to_client(
+    monkeypatch,
+    runner,
+    config_factory,
+    roster_factory,
+    fake_client,
+) -> None:
+    from gh_edu.cli import app
+
+    captured: list[int | None] = []
+
+    def record_client(_config, github_timeout_seconds=None):
+        captured.append(github_timeout_seconds)
+        return fake_client
+
+    monkeypatch.setattr("gh_edu.cli.make_client", record_client)
+    config_path = config_factory()
+    roster_path = roster_factory()
+
+    result = runner.invoke(
+        app,
+        [
+            "status",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--github-timeout-seconds",
+            "360",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == [360]
+
+
+@pytest.mark.parametrize("value", ["0", "3601", "not-a-number"])
+def test_cli_rejects_invalid_timeout_before_github_call(
+    runner,
+    config_factory,
+    value,
+) -> None:
+    from gh_edu.cli import app
+
+    result = runner.invoke(
+        app,
+        [
+            "auth",
+            "check",
+            "--config",
+            str(config_factory()),
+            "--github-timeout-seconds",
+            value,
+        ],
+    )
+
+    assert result.exit_code == 2
+
+
 def test_tty_progress_uses_one_updating_aggregate_line(monkeypatch) -> None:
     from gh_edu.cli import ConsoleProgress
 

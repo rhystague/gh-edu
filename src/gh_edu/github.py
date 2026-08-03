@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from typing import Protocol, cast
 from urllib.parse import quote
 
+DEFAULT_GITHUB_TIMEOUT_SECONDS = 180
+
 
 @dataclass(frozen=True, slots=True)
 class Team:
@@ -361,7 +363,7 @@ class GhCliClient:
         *,
         hostname: str = "github.com",
         api_version: str = "2022-11-28",
-        timeout: float = 30.0,
+        timeout: float = DEFAULT_GITHUB_TIMEOUT_SECONDS,
         executable: str = "gh",
     ) -> None:
         if not hostname.strip():
@@ -800,7 +802,9 @@ class GhCliClient:
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise GitHubNetworkError(
-                f"GitHub CLI timed out while attempting to {operation}",
+                f"GitHub CLI timed out after {self._timeout:g} seconds while attempting "
+                f"to {operation}. Increase execution.github_timeout_seconds or rerun "
+                "with --github-timeout-seconds N.",
                 operation=operation,
             ) from exc
         except OSError as exc:

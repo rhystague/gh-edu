@@ -104,6 +104,7 @@ def test_get_organisation_parses_age_and_plan_metadata(
     assert organisation.created_at == "2020-01-01T00:00:00Z"
     assert organisation.plan_name == "team"
     assert calls[0][0][2] == "/orgs/teaching-org"
+    assert calls[0][1]["timeout"] == 180
 
 
 def test_invitation_abuse_422_is_a_recoverable_limit(
@@ -582,6 +583,47 @@ def test_subprocess_start_failures_are_sanitised_typed_errors(
 
     with pytest.raises(error_type):
         GhCliClient().get_repository("template-owner", "template")
+
+
+def test_repository_listing_uses_configured_complete_command_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float] = []
+
+    def fake_run(args, **kwargs):
+        timeout = kwargs["timeout"]
+        calls.append(timeout)
+        if timeout < 91:
+            raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+        return _completed(
+            stdout=json.dumps(
+                [
+                    [
+                        {
+                            "id": 10,
+                            "name": "course-repository",
+                            "full_name": "teaching-org/course-repository",
+                            "private": True,
+                        }
+                    ]
+                ]
+            )
+        )
+
+    monkeypatch.setattr("gh_edu.github.subprocess.run", fake_run)
+
+    with pytest.raises(GitHubNetworkError) as raised:
+        GhCliClient(timeout=30).list_repositories("teaching-org")
+
+    repositories = GhCliClient(timeout=180).list_repositories("teaching-org")
+
+    assert calls == [30, 180]
+    assert [repository.name for repository in repositories] == ["course-repository"]
+    message = str(raised.value)
+    assert "after 30 seconds" in message
+    assert "list repositories in organisation teaching-org" in message
+    assert "execution.github_timeout_seconds" in message
+    assert "--github-timeout-seconds" in message
 
 
 def test_invalid_json_is_reported_without_decoder_details(
