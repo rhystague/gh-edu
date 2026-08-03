@@ -388,6 +388,15 @@ rolling invitation slot, or conservatively for 24 hours. The command retries
 the same reviewed action; it never silently replans during a wait. External
 drift is handled by the existing execution and verification safety checks.
 
+GitHub can also reject repository generation from a template with HTTP 422 and
+`Could not clone: was submitted too quickly`. `gh-edu` treats only that exact,
+repository-generation-specific response as recoverable. With
+`--wait-for-limits`, it waits for the server-provided or exponential cooldown,
+then reads the exact target repository before submitting another create. A
+private active repository found by that read is adopted; a missing repository
+is retried; and a public or archived repository fails the existing safety
+checks. Without the flag, the apply stops with exit code `5` before retrying.
+
 The terminal shows discovery and verification phases. On a TTY, one live line
 shows processed and total writes, percentage, successes, failures, elapsed
 time, and minimum ETA. Redirected output writes a permanent summary every ten
@@ -395,12 +404,14 @@ writes or thirty seconds. Long-wait messages refresh at least once per minute
 and include the exact local resume time. Progress lines contain no student
 email addresses.
 
-Write-attempt timestamps are saved atomically in `paths.execution_state` and
-old timestamps are pruned from the rolling windows. Apply holds an exclusive
-lock, so two local processes sharing the path cannot consume the same budget.
-The file records the GitHub hostname and organisation and is rejected if reused
-for a different target. Keep one execution-state path shared by every local
-configuration that targets that organisation.
+Write-attempt timestamps and any remote-limit retry deadline are saved
+atomically in `paths.execution_state`; old timestamps are pruned from the
+rolling windows. A restart honors an unexpired remote cooldown before making
+another write. Apply holds an exclusive lock, so two local processes sharing
+the path cannot consume the same budget. The file records the GitHub hostname
+and organisation and is rejected if reused for a different target. Keep one
+execution-state path shared by every local configuration that targets that
+organisation.
 
 `Ctrl-C` is safe: the remote resources, ledger, and execution state remain, and
 the same command can be rerun. Another machine or writes made directly in

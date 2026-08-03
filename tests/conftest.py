@@ -18,6 +18,7 @@ from gh_edu.core import ExecutionPacer, InvitationLedger, LedgerRecord
 from gh_edu.github import (
     FailedInvitation,
     GitHubError,
+    GitHubNotFoundError,
     Invitation,
     Organisation,
     Repository,
@@ -223,7 +224,16 @@ class FakeGitHubClient:
     def get_repository(self, owner: str, name: str) -> Repository:
         target = f"{owner}/{name}"
         self._record("get_repository", "GET", target)
-        return self.template
+        if target.casefold() == self.template.name_with_owner.casefold():
+            return self.template
+        repository = self.repositories.get(name)
+        if owner.casefold() == self.organisation.login.casefold() and repository is not None:
+            return repository
+        raise GitHubNotFoundError(
+            f"repository {target} does not exist",
+            status_code=404,
+            operation=f"read repository {target}",
+        )
 
     def list_teams(self, org: str) -> list[Team]:
         self._record("list_teams", "GET", org)

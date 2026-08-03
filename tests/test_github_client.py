@@ -12,6 +12,7 @@ from gh_edu.github import (
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubRateLimitError,
+    GitHubRepositoryGenerationLimitError,
     GitHubResponseError,
 )
 
@@ -141,6 +142,79 @@ def test_ordinary_invitation_422_remains_a_permanent_response_error(
         GhCliClient().invite_member("teaching-org", "student@example.edu.au", [123])
 
     assert not isinstance(raised.value, GitHubInvitationLimitError)
+
+
+def test_repository_generation_too_quickly_422_is_a_recoverable_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout='{"message":"Could not clone: was submitted too quickly"}',
+                stderr=(
+                    "gh: request failed (HTTP 422)\n"
+                    "Retry-After: 90\n"
+                    "X-RateLimit-Reset: 1785729600"
+                ),
+                returncode=1,
+            )
+        ],
+    )
+
+    with pytest.raises(GitHubRepositoryGenerationLimitError) as raised:
+        GhCliClient().create_repository_from_template(
+            "template-owner",
+            "template",
+            "teaching-org",
+            "expected-repository",
+        )
+
+    assert raised.value.status_code == 422
+    assert raised.value.retry_after_seconds == 90
+    assert raised.value.reset_at_epoch == 1785729600
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_error"),
+    [
+        ("repository", GitHubResponseError),
+        ("team", GitHubResponseError),
+    ],
+)
+def test_repository_generation_limit_signature_is_narrowly_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    expected_error: type[Exception],
+) -> None:
+    message = (
+        "Validation Failed"
+        if operation == "repository"
+        else "Could not clone: was submitted too quickly"
+    )
+    _install_recorder(
+        monkeypatch,
+        [
+            _completed(
+                stdout=json.dumps({"message": message}),
+                stderr="gh: request failed (HTTP 422)",
+                returncode=1,
+            )
+        ],
+    )
+
+    with pytest.raises(expected_error) as raised:
+        if operation == "repository":
+            GhCliClient().create_repository_from_template(
+                "template-owner",
+                "template",
+                "teaching-org",
+                "expected-repository",
+            )
+        else:
+            GhCliClient().create_team("teaching-org", "expected-team")
+
+    assert not isinstance(raised.value, GitHubRepositoryGenerationLimitError)
 
 
 def test_create_team_builds_exact_post_fields_and_parses_identity(

@@ -147,6 +147,10 @@ class GitHubInvitationLimitError(GitHubRateLimitError):
     """GitHub rejected an invitation because its abuse window was exhausted."""
 
 
+class GitHubRepositoryGenerationLimitError(GitHubRateLimitError):
+    """GitHub throttled repository generation from a template."""
+
+
 class GitHubNotFoundError(GitHubResponseError):
     """The requested GitHub resource was not found or was not visible."""
 
@@ -854,6 +858,28 @@ class GhCliClient:
         )
         if invitation_abuse:
             raise GitHubInvitationLimitError(
+                message,
+                status_code=status_code,
+                operation=operation,
+                retry_after_seconds=_extract_header_integer(
+                    f"{stderr}\n{stdout}",
+                    _RETRY_AFTER_PATTERN,
+                ),
+                reset_at_epoch=_extract_header_integer(
+                    f"{stderr}\n{stdout}",
+                    _RESET_AT_PATTERN,
+                ),
+            )
+
+        repository_generation_limit = (
+            status_code == 422
+            and operation.startswith("create repository ")
+            and " from template " in operation
+            and "could not clone" in diagnostic
+            and "submitted too quickly" in diagnostic
+        )
+        if repository_generation_limit:
+            raise GitHubRepositoryGenerationLimitError(
                 message,
                 status_code=status_code,
                 operation=operation,

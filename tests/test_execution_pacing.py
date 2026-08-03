@@ -231,6 +231,120 @@ def test_remote_limit_without_wait_consent_returns_reset_time(tmp_path: Path) ->
 
     assert raised.value.next_eligible_at == start + timedelta(minutes=5)
     assert clock.sleeps == []
+    saved = load_execution_state(
+        tmp_path / "execution-state.json",
+        hostname="github.com",
+        organisation="teaching-org",
+    )
+    assert saved.remote_retry_not_before == start + timedelta(minutes=5)
+
+
+def test_persisted_remote_cooldown_stops_or_waits_before_writing(tmp_path: Path) -> None:
+    start = datetime(2026, 7, 31, 0, 0, tzinfo=UTC)
+    resume_at = start + timedelta(minutes=2)
+    path = tmp_path / "execution-state.json"
+    state = ExecutionState(
+        hostname="github.com",
+        organisation="teaching-org",
+        remote_retry_not_before=resume_at,
+    )
+    stopped_clock = FakeClock(start)
+    stopped = ExecutionPacer(
+        path=path,
+        state=state.model_copy(deep=True),
+        content_limit=450,
+        invitation_limit=450,
+        total_writes=1,
+        wait_for_limits=False,
+        now=stopped_clock.now,
+        sleep=stopped_clock.sleep,
+    )
+
+    with pytest.raises(ExecutionLimitError) as raised:
+        stopped.before_write(invitation=False)
+
+    assert raised.value.next_eligible_at == resume_at
+    assert not stopped.state.content_writes
+
+    waiting_clock = FakeClock(start)
+    waiting = ExecutionPacer(
+        path=path,
+        state=state.model_copy(deep=True),
+        content_limit=450,
+        invitation_limit=450,
+        total_writes=1,
+        wait_for_limits=True,
+        now=waiting_clock.now,
+        sleep=waiting_clock.sleep,
+    )
+
+    waiting.before_write(invitation=False)
+
+    assert waiting_clock.current == resume_at
+    assert waiting_clock.sleeps == [60.0, 60.0]
+    saved = load_execution_state(
+        path,
+        hostname="github.com",
+        organisation="teaching-org",
+    )
+    assert saved.remote_retry_not_before is None
+    assert saved.content_writes == [resume_at]
+
+
+def test_expired_remote_cooldown_is_cleared_without_waiting(tmp_path: Path) -> None:
+    current = datetime(2026, 7, 31, 0, 5, tzinfo=UTC)
+    clock = FakeClock(current)
+    pacer = ExecutionPacer(
+        path=tmp_path / "execution-state.json",
+        state=ExecutionState(
+            hostname="github.com",
+            organisation="teaching-org",
+            remote_retry_not_before=current - timedelta(minutes=1),
+        ),
+        content_limit=450,
+        invitation_limit=450,
+        total_writes=1,
+        wait_for_limits=False,
+        now=clock.now,
+        sleep=clock.sleep,
+    )
+
+    pacer.before_write(invitation=False)
+
+    assert clock.sleeps == []
+    assert pacer.state.remote_retry_not_before is None
+
+
+def test_interrupted_remote_limit_wait_preserves_cooldown(tmp_path: Path) -> None:
+    start = datetime(2026, 7, 31, 0, 0, tzinfo=UTC)
+    path = tmp_path / "execution-state.json"
+
+    def interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    pacer = ExecutionPacer(
+        path=path,
+        state=ExecutionState(hostname="github.com", organisation="teaching-org"),
+        content_limit=450,
+        invitation_limit=450,
+        total_writes=1,
+        wait_for_limits=True,
+        now=lambda: start,
+        sleep=interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        pacer.handle_remote_limit(
+            GitHubRateLimitError("limited", retry_after_seconds=120),
+            invitation=False,
+        )
+
+    saved = load_execution_state(
+        path,
+        hostname="github.com",
+        organisation="teaching-org",
+    )
+    assert saved.remote_retry_not_before == start + timedelta(minutes=2)
 
 
 def test_progress_callback_contains_only_aggregate_status(tmp_path: Path) -> None:
@@ -302,6 +416,42 @@ def test_execution_state_path_validation_and_locking(config_factory) -> None:
         lock_execution_state(path),
     ):
         pass
+
+
+def test_version_one_execution_state_without_remote_cooldown_still_loads(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "execution-state.json"
+    path.write_text(
+        '{"schema_version":1,"hostname":"github.com",'
+        '"organisation":"teaching-org","content_writes":[],"invitations":[]}\n',
+        encoding="utf-8",
+    )
+
+    state = load_execution_state(
+        path,
+        hostname="github.com",
+        organisation="teaching-org",
+    )
+
+    assert state.remote_retry_not_before is None
+
+
+def test_execution_state_rejects_naive_remote_cooldown(tmp_path: Path) -> None:
+    path = tmp_path / "execution-state.json"
+    path.write_text(
+        '{"schema_version":1,"hostname":"github.com",'
+        '"organisation":"teaching-org","content_writes":[],"invitations":[],'
+        '"remote_retry_not_before":"2026-07-31T12:00:00"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InputValidationError, match="must include a timezone"):
+        load_execution_state(
+            path,
+            hostname="github.com",
+            organisation="teaching-org",
+        )
 
 
 def test_execution_state_prunes_old_timestamps_and_saves_atomically(

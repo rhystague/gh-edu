@@ -47,6 +47,7 @@ from gh_edu.github import (
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubRateLimitError,
+    GitHubRepositoryGenerationLimitError,
     GitHubResponseError,
     Invitation,
     Organisation,
@@ -696,6 +697,7 @@ class ExecutionState(StrictModel):
     organisation: str
     content_writes: list[datetime] = Field(default_factory=list)
     invitations: list[datetime] = Field(default_factory=list)
+    remote_retry_not_before: datetime | None = None
 
     @field_validator("content_writes", "invitations")
     @classmethod
@@ -703,6 +705,16 @@ class ExecutionState(StrictModel):
         if any(value.tzinfo is None for value in values):
             raise ValueError("execution-state timestamps must include a timezone")
         return values
+
+    @field_validator("remote_retry_not_before")
+    @classmethod
+    def require_aware_remote_retry(
+        cls,
+        value: datetime | None,
+    ) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("execution-state remote retry timestamp must include a timezone")
+        return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -979,6 +991,18 @@ class ExecutionPacer:
 
     def before_write(self, *, invitation: bool) -> None:
         current = self.now()
+        remote_retry_not_before = self.state.remote_retry_not_before
+        if remote_retry_not_before is not None:
+            if remote_retry_not_before > current:
+                self.metrics.next_eligible_at = remote_retry_not_before
+                self._wait_until(
+                    "GitHub remote rate-limit cooldown is active",
+                    remote_retry_not_before,
+                    pacing=False,
+                )
+                current = self.now()
+            self.state.remote_retry_not_before = None
+            save_execution_state_atomic(self.path, self.state)
         prior_attempts = self.state.content_writes
         pacing_anchor = self.last_attempt_finished_at
         if prior_attempts:
@@ -1051,8 +1075,15 @@ class ExecutionPacer:
         else:
             seconds = min(3600, 60 * (2 ** (self._remote_retries - 1)))
             resume_at = current + timedelta(seconds=seconds)
+        persisted_resume_at = self.state.remote_retry_not_before
+        if persisted_resume_at is not None and persisted_resume_at > resume_at:
+            resume_at = persisted_resume_at
+        self.state.remote_retry_not_before = resume_at
+        save_execution_state_atomic(self.path, self.state)
         self.metrics.next_eligible_at = resume_at
         self._wait_until("GitHub reported a recoverable rate limit", resume_at, pacing=False)
+        self.state.remote_retry_not_before = None
+        save_execution_state_atomic(self.path, self.state)
 
     def finish_action(self, *, phase: str, succeeded: bool) -> None:
         self.processed += 1
@@ -3426,17 +3457,70 @@ def _adopt_pending_after_invitation_error(
     return None
 
 
+def _recover_repository_after_generation_limit(
+    client: GitHubClient,
+    organisation: str,
+    repository: str,
+    error: GitHubRateLimitError,
+) -> Repository | None:
+    if not isinstance(error, GitHubRepositoryGenerationLimitError):
+        return None
+    try:
+        recovered = client.get_repository(organisation, repository)
+    except GitHubNotFoundError:
+        return None
+    operation = f"recover repository {organisation}/{repository} after generation throttling"
+    if recovered.name != repository:
+        raise GitHubResponseError(
+            f"GitHub returned an unexpected repository name during recovery: {recovered.name!r}",
+            operation=operation,
+        )
+    if not recovered.is_private:
+        raise GitHubResponseError(
+            f"Recovered repository {organisation}/{repository} is public",
+            operation=operation,
+        )
+    if recovered.is_archived:
+        raise GitHubResponseError(
+            f"Recovered repository {organisation}/{repository} is archived",
+            operation=operation,
+        )
+    return recovered
+
+
 def _run_paced_write(
     pacer: ExecutionPacer | None,
     *,
     action_type: ActionType,
     invitation: bool = False,
     operation: Callable[[], Any],
+    recover_after_limit: Callable[[GitHubRateLimitError], Any | None] | None = None,
 ) -> Any:
     if pacer is None:
         return operation()
     phase = action_type.value.casefold().replace("_", " ")
+    pending_recovery: GitHubRateLimitError | None = None
     while True:
+        if pending_recovery is not None and recover_after_limit is not None:
+            try:
+                recovered = recover_after_limit(pending_recovery)
+            except GitHubRateLimitError as recovery_error:
+                try:
+                    pacer.handle_remote_limit(
+                        recovery_error,
+                        invitation=invitation,
+                    )
+                except ExecutionLimitError:
+                    pacer.finish_action(phase=phase, succeeded=False)
+                    raise
+                continue
+            except Exception:
+                pacer.finish_action(phase=phase, succeeded=False)
+                raise
+            if recovered is not None:
+                pacer.finish_action(phase=phase, succeeded=True)
+                return recovered
+            pending_recovery = None
         try:
             pacer.before_write(invitation=invitation)
         except ExecutionLimitError:
@@ -3451,6 +3535,8 @@ def _run_paced_write(
             except ExecutionLimitError:
                 pacer.finish_action(phase=phase, succeeded=False)
                 raise
+            if recover_after_limit is not None:
+                pending_recovery = exc
             continue
         except Exception:
             pacer.finish_attempt()
@@ -3646,6 +3732,22 @@ def execute_plan(
                     raise RuntimeError("CREATE_REPOSITORY action has no repository name")
                 repository_name = action.repository
                 repository_description = action.description or ""
+                repository_recovered = False
+
+                def recover_repository(
+                    error: GitHubRateLimitError,
+                    target_repository: str = repository_name,
+                ) -> Repository | None:
+                    nonlocal repository_recovered
+                    repository = _recover_repository_after_generation_limit(
+                        client,
+                        config.organisation,
+                        target_repository,
+                        error,
+                    )
+                    repository_recovered = repository is not None
+                    return repository
+
                 created_repository = _run_paced_write(
                     pacer,
                     action_type=action.action_type,
@@ -3657,6 +3759,7 @@ def execute_plan(
                         repository_name,
                         repository_description,
                     ),
+                    recover_after_limit=recover_repository,
                 )
                 if created_repository.name != action.repository:
                     raise RuntimeError(
@@ -3668,6 +3771,11 @@ def execute_plan(
                 if created_repository.is_archived:
                     raise RuntimeError(
                         f"GitHub created repository {action.repository!r} as archived"
+                    )
+                if repository_recovered:
+                    action.reason = (
+                        "GitHub throttled repository generation, but the exact "
+                        "private active repository was discovered after the cooldown"
                     )
             elif action.action_type in {
                 ActionType.GRANT_TEAM_REPOSITORY,

@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 
-from gh_edu.core import ExecutionProgress, load_configuration, reports_path
-from gh_edu.github import GitHubAuthError, GitHubError, GitHubRateLimitError
+from gh_edu.core import (
+    ExecutionProgress,
+    load_configuration,
+    load_execution_state,
+    reports_path,
+)
+from gh_edu.github import (
+    GitHubAuthError,
+    GitHubError,
+    GitHubRateLimitError,
+    GitHubRepositoryGenerationLimitError,
+)
 
 
 def test_help_exposes_required_surface_and_no_supervisor_command(
@@ -560,6 +571,286 @@ def test_wait_for_limits_retries_server_rate_limit(
     assert len(create_calls) == 2
     report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
     assert "Rate-limit retries: 1" in report.read_text(encoding="utf-8")
+
+
+def test_wait_for_limits_retries_throttled_repository_generation_after_absence_check(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    repository_name = "COMP3018-2026S2-G01"
+    fake_client.fail_next(
+        "create_repository_from_template",
+        GitHubRepositoryGenerationLimitError("submitted too quickly"),
+        target=repository_name,
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+            "--wait-for-limits",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    create_calls = [
+        call
+        for call in fake_client.calls
+        if call.operation == "create_repository_from_template"
+    ]
+    recovery_reads = [
+        call
+        for call in fake_client.calls
+        if call.operation == "get_repository"
+        and call.target == f"teaching-org/{repository_name}"
+    ]
+    assert len(create_calls) == 2
+    assert len(recovery_reads) == 1
+    report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
+    assert "Rate-limit retries: 1" in report.read_text(encoding="utf-8")
+
+
+def test_rate_limited_recovery_read_is_retried_before_repository_create(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    repository_name = "COMP3018-2026S2-G01"
+    fake_client.fail_next(
+        "create_repository_from_template",
+        GitHubRepositoryGenerationLimitError("submitted too quickly"),
+        target=repository_name,
+    )
+    fake_client.fail_next(
+        "get_repository",
+        GitHubRateLimitError("recovery read limited", retry_after_seconds=30),
+        target=f"teaching-org/{repository_name}",
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+            "--wait-for-limits",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    create_calls = [
+        call
+        for call in fake_client.calls
+        if call.operation == "create_repository_from_template"
+    ]
+    recovery_reads = [
+        call
+        for call in fake_client.calls
+        if call.operation == "get_repository"
+        and call.target == f"teaching-org/{repository_name}"
+    ]
+    assert len(create_calls) == 2
+    assert len(recovery_reads) == 2
+    report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
+    assert "Rate-limit retries: 2" in report.read_text(encoding="utf-8")
+
+
+def test_repository_generation_limit_without_wait_stops_and_persists_retry_time(
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+    fixed_now,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    repository_name = "COMP3018-2026S2-G01"
+    fake_client.fail_next(
+        "create_repository_from_template",
+        GitHubRepositoryGenerationLimitError("submitted too quickly"),
+        target=repository_name,
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+        ],
+    )
+
+    assert result.exit_code == 5
+    assert "Apply paused by an execution limit" in result.output
+    assert "Next eligible write" in next(
+        (config_path.parent / "reports").glob("*_provision-apply.md")
+    ).read_text(encoding="utf-8")
+    create_calls = [
+        call
+        for call in fake_client.calls
+        if call.operation == "create_repository_from_template"
+    ]
+    assert len(create_calls) == 1
+    assert not [
+        call
+        for call in fake_client.write_calls
+        if call.operation in {"set_team_repository_permission", "invite_member"}
+    ]
+    state = load_execution_state(
+        config_path.parent / ".gh-edu" / "teaching-org-execution-state.json",
+        hostname="github.com",
+        organisation="teaching-org",
+    )
+    assert state.remote_retry_not_before == fixed_now + timedelta(seconds=61)
+
+
+def test_throttled_repository_created_despite_error_is_adopted(
+    monkeypatch,
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    repository_name = "COMP3018-2026S2-G01"
+    original_list_repositories = fake_client.list_repositories
+    inserted = False
+
+    def list_repositories_with_concurrent_create(org: str):
+        nonlocal inserted
+        repositories = original_list_repositories(org)
+        if not inserted:
+            fake_client.add_repository(repository_name)
+            inserted = True
+        return repositories
+
+    monkeypatch.setattr(
+        fake_client,
+        "list_repositories",
+        list_repositories_with_concurrent_create,
+    )
+    fake_client.fail_next(
+        "create_repository_from_template",
+        GitHubRepositoryGenerationLimitError("submitted too quickly"),
+        target=repository_name,
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+            "--wait-for-limits",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    create_calls = [
+        call
+        for call in fake_client.calls
+        if call.operation == "create_repository_from_template"
+    ]
+    assert len(create_calls) == 1
+    report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
+    assert (
+        "the exact private active repository was discovered after the cooldown"
+        in report.read_text(encoding="utf-8")
+    )
+
+
+@pytest.mark.parametrize(
+    ("private", "archived", "message"),
+    [(False, False, "is public"), (True, True, "is archived")],
+)
+def test_unsafe_repository_is_not_adopted_after_generation_limit(
+    monkeypatch,
+    config_factory,
+    roster_factory,
+    fake_client,
+    invoke_cli,
+    private: bool,
+    archived: bool,
+    message: str,
+) -> None:
+    config_path = config_factory()
+    roster_path = roster_factory()
+    repository_name = "COMP3018-2026S2-G01"
+    original_list_repositories = fake_client.list_repositories
+    inserted = False
+
+    def list_repositories_with_unsafe_create(org: str):
+        nonlocal inserted
+        repositories = original_list_repositories(org)
+        if not inserted:
+            fake_client.add_repository(
+                repository_name,
+                private=private,
+                archived=archived,
+            )
+            inserted = True
+        return repositories
+
+    monkeypatch.setattr(
+        fake_client,
+        "list_repositories",
+        list_repositories_with_unsafe_create,
+    )
+    fake_client.fail_next(
+        "create_repository_from_template",
+        GitHubRepositoryGenerationLimitError("submitted too quickly"),
+        target=repository_name,
+    )
+
+    result = invoke_cli(
+        fake_client,
+        [
+            "provision",
+            "groups",
+            "--config",
+            str(config_path),
+            "--roster",
+            str(roster_path),
+            "--apply",
+            "--wait-for-limits",
+        ],
+    )
+
+    assert result.exit_code == 3
+    create_calls = [
+        call
+        for call in fake_client.calls
+        if call.operation == "create_repository_from_template"
+    ]
+    assert len(create_calls) == 1
+    report = next((config_path.parent / "reports").glob("*_provision-apply.md"))
+    assert message in report.read_text(encoding="utf-8")
 
 
 def test_apply_without_wait_stops_at_local_hourly_budget(
